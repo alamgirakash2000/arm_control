@@ -1,11 +1,18 @@
 # Piper Arm Delta Controller
 
+
+
 ## Files
 - `piper_control.py` — Main control script (interactive dx, dy, dz commands)
 - `start.sh` — One-command launcher (starts MoveIt + RViz + control script)
 
 
 ## Usage
+
+### Run
+```bash
+python3 piper_direct.py 
+```
 
 ### Simulation (RViz with fake controllers)
 ```bash

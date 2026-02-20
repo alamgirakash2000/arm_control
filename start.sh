@@ -26,10 +26,21 @@ fi
 echo "  Connecting to ROS 2 ..."
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
+# Use UDP transport only to avoid FastDDS SHM lock conflicts.
+export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 echo "  Connecting to ROS 2 ... Done"
 
 # Track background PIDs for cleanup
 PIDS=()
+
+preflight_cleanup() {
+    # Kill stale processes from previous failed/aborted runs.
+    pkill -9 -f piper_single_ctrl >/dev/null 2>&1 || true
+    pkill -9 -f 'ros2 launch piper_with_gripper_moveit demo.launch.py' >/dev/null 2>&1 || true
+    pkill -9 -f '/opt/ros/humble/lib/moveit_ros_move_group/move_group' >/dev/null 2>&1 || true
+    pkill -9 -f '/opt/ros/humble/lib/controller_manager/ros2_control_node' >/dev/null 2>&1 || true
+    pkill -9 -f '/opt/ros/humble/lib/rviz2/rviz2' >/dev/null 2>&1 || true
+}
 
 cleanup() {
     echo ""
@@ -46,6 +57,8 @@ cleanup() {
 }
 
 trap cleanup SIGINT SIGTERM
+
+preflight_cleanup
 
 # ---- Step 1: Start real robot driver (only in --real mode) ----
 if [ "$USE_REAL_ROBOT" = true ]; then

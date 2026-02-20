@@ -45,7 +45,8 @@ HOME_POSITION = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 # Small offset used to force MoveIt to generate a real trajectory
 PRE_HOME_POSITION = [0.05, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-DEFAULT_SPEED = 0.1
+DEFAULT_SPEED = 0.6
+IK_CHECK_TIMEOUT_SEC = 0.05
 
 
 class PiperDeltaController:
@@ -70,6 +71,12 @@ class PiperDeltaController:
         self.moveit2.max_velocity = DEFAULT_SPEED
         self.moveit2.max_acceleration = DEFAULT_SPEED
 
+        # Fast IK service used only for quick skip of unreachable targets.
+        from moveit_msgs.srv import GetPositionIK
+        self._ik_client = self.node.create_client(
+            GetPositionIK, "/compute_ik", callback_group=callback_group
+        )
+
         self.executor = MultiThreadedExecutor(num_threads=4)
         self.executor.add_node(self.node)
         self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
@@ -80,6 +87,43 @@ class PiperDeltaController:
         self.tf_listener = TransformListener(self.tf_buffer, self.node)
 
         time.sleep(3.0)
+
+    def _check_ik_reachable(self, x, y, z, qx, qy, qz, qw):
+        """
+        Return False quickly if target pose is clearly unreachable.
+        Fail-open on service errors/timeouts so valid movement behavior is unaffected.
+        """
+        from moveit_msgs.srv import GetPositionIK
+        from geometry_msgs.msg import PoseStamped
+
+        if not self._ik_client.service_is_ready():
+            if not self._ik_client.wait_for_service(timeout_sec=0.5):
+                return True
+
+        req = GetPositionIK.Request()
+        req.ik_request.group_name = GROUP_NAME
+        req.ik_request.avoid_collisions = True
+
+        ps = PoseStamped()
+        ps.header.frame_id = BASE_LINK
+        ps.pose.position.x = float(x)
+        ps.pose.position.y = float(y)
+        ps.pose.position.z = float(z)
+        ps.pose.orientation.x = float(qx)
+        ps.pose.orientation.y = float(qy)
+        ps.pose.orientation.z = float(qz)
+        ps.pose.orientation.w = float(qw)
+        req.ik_request.pose_stamped = ps
+
+        future = self._ik_client.call_async(req)
+        deadline = time.time() + IK_CHECK_TIMEOUT_SEC
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.002)
+
+        if future.done() and future.result() is not None:
+            return future.result().error_code.val == 1  # MoveItErrorCodes.SUCCESS
+
+        return True
 
     def get_current_pose(self):
         """Get the current end-effector position and orientation."""
@@ -114,6 +158,10 @@ class PiperDeltaController:
         ]
         quat = pose["orientation"]
 
+        if not self._check_ik_reachable(*new_pos, *quat):
+            print("Skipped (unreachable)")
+            return False
+
         self.moveit2.move_to_pose(
             position=new_pos,
             quat_xyzw=quat,
@@ -128,12 +176,17 @@ class PiperDeltaController:
         """Move end-effector to an absolute pose."""
         print(f"  Moving to x={x:.4f} y={y:.4f} z={z:.4f} ...", end=" ", flush=True)
 
+        if not self._check_ik_reachable(x, y, z, qx, qy, qz, qw):
+            print("Skipped (unreachable)")
+            return False
+
         self.moveit2.move_to_pose(
             position=[x, y, z],
             quat_xyzw=[qx, qy, qz, qw],
             cartesian=False,
         )
         self.moveit2.wait_until_executed()
+
         print("Done")
         return True
 
