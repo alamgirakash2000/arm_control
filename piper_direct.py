@@ -295,7 +295,7 @@ class PiperDirectController:
 
     def __init__(self, can_port="can0"):
         self.piper = C_PiperInterface_V2(can_port)
-        self.speed = 50  # percent (1-100)
+        self.speed = 30  # percent (1-100)
         self._connected = False
 
     def connect(self):
@@ -380,6 +380,7 @@ class PiperDirectController:
         RY = round(math.degrees(pitch) * 1000)
         RZ = round(math.degrees(yaw) * 1000)
 
+        initial_pos, _ = self.read_pose()
         start = time.time()
         while time.time() - start < timeout:
             self.piper.MotionCtrl_2(0x01, 0x00, self.speed, 0x00)
@@ -395,6 +396,16 @@ class PiperDirectController:
             if pos_err < pos_tol:
                 return True
 
+            # Early abort: if robot hasn't moved after 0.2s, target is unreachable
+            if time.time() - start > 0.2:
+                moved = math.sqrt(
+                    (cur_pos[0] - initial_pos[0]) ** 2 +
+                    (cur_pos[1] - initial_pos[1]) ** 2 +
+                    (cur_pos[2] - initial_pos[2]) ** 2
+                )
+                if moved < 0.001:
+                    return False
+
         return False
 
     def get_pose(self):
@@ -406,10 +417,6 @@ class PiperDirectController:
     def move_delta(self, dx, dy, dz):
         """Move EE by delta (meters) using firmware Cartesian control."""
         norm = math.sqrt(dx * dx + dy * dy + dz * dz)
-        if norm > 0.30:
-            scale = 0.30 / norm
-            dx, dy, dz = dx * scale, dy * scale, dz * scale
-            print(f"  (clamped to 30cm max)")
 
         print(f"  Moving dx={dx*100:.1f} dy={dy*100:.1f} dz={dz*100:.1f} cm ...", end=" ", flush=True)
 
@@ -418,12 +425,34 @@ class PiperDirectController:
         ty = cur_pos[1] + dy
         tz = cur_pos[2] + dz
 
-        if self.send_cartesian(tx, ty, tz, cur_rpy[0], cur_rpy[1], cur_rpy[2]):
+        # Timeout scales with distance: bigger moves need more time
+        t = max(1.0, norm * 15)
+
+        if self.send_cartesian(tx, ty, tz, cur_rpy[0], cur_rpy[1], cur_rpy[2], timeout=t):
             print("Done")
             return True
-        else:
-            print("Timeout")
-            return False
+
+        # Full move unreachable — try reducing each axis by 1-3cm
+        for step in [1, 2, 3]:
+            for axis in range(3):
+                d = [dx, dy, dz]
+                if d[axis] > 0:
+                    d[axis] -= step * 0.01
+                elif d[axis] < 0:
+                    d[axis] += step * 0.01
+                else:
+                    continue
+                ntx = cur_pos[0] + d[0]
+                nty = cur_pos[1] + d[1]
+                ntz = cur_pos[2] + d[2]
+                n = math.sqrt(d[0] ** 2 + d[1] ** 2 + d[2] ** 2)
+                t_s = max(1.0, n * 15)
+                if self.send_cartesian(ntx, nty, ntz, cur_rpy[0], cur_rpy[1], cur_rpy[2], timeout=t_s):
+                    print(f"Done (adjusted: {d[0]*100:.0f} {d[1]*100:.0f} {d[2]*100:.0f} cm)")
+                    return True
+
+        print("unreachable")
+        return False
 
     def move_to(self, x, y, z, roll=None, pitch=None, yaw=None):
         """Move EE to absolute position using firmware Cartesian control."""
