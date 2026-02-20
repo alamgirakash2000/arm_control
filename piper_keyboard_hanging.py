@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Keyboard Controller for Piper Arm
-===================================
+Keyboard Controller for Hanging Piper Arm
+==========================================
 Move the robot 1cm per keypress using keyboard keys.
-Imports PiperDirectController from piper_direct.py.
+Uses PiperHangingController with mid-range home and safe transitions.
 
 Usage:
-    python3 piper_keyboard.py
-    python3 piper_keyboard.py --can can1
+    python3 piper_keyboard_hanging.py
+    python3 piper_keyboard_hanging.py --can can1
 """
 
 import sys
 import tty
 import termios
-from piper_direct import PiperDirectController, HOME_POSITION
+from piper_hanging import (
+    PiperHangingController, HOME_POSITION, RELAX_POSITION, SAFE_POSITION,
+    JOINT_LOWER,
+)
 
 STEP = 0.01  # 1cm in meters
 
@@ -23,7 +26,7 @@ KEY_MAP = {
     's': (-1,  0,  0),   # -X backward
     'a': ( 0,  1,  0),   # +Y left
     'd': ( 0, -1,  0),   # -Y right
-    'q': ( 0,  0,  1),   # +Z up
+    'q': ( 0,  0,  1),   # +Z up  (real world up, thanks to T_BASE flip)
     'e': ( 0,  0, -1),   # -Z down
 }
 
@@ -58,7 +61,7 @@ def main():
             continue
         i += 1
 
-    ctrl = PiperDirectController(can_port=can_port)
+    ctrl = PiperHangingController(can_port=can_port)
     if not ctrl.connect():
         print("Failed to connect.")
         sys.exit(1)
@@ -67,12 +70,13 @@ def main():
 
     print()
     print("=" * 50)
-    print("  KEYBOARD CONTROL  (1cm per press)")
+    print("  KEYBOARD CONTROL — HANGING  (1cm per press)")
     print("=" * 50)
-    print("  w/s    +X / -X")
-    print("  a/d    +Y / -Y")
-    print("  q/e    +Z / -Z")
-    print("  r      home")
+    print("  w/s    +X / -X  (forward / backward)")
+    print("  a/d    +Y / -Y  (left / right)")
+    print("  q/e    +Z / -Z  (up / down)")
+    print("  r      home     (safe -> mid-range)")
+    print("  t      relax    (safe -> elbow -> hang)")
     print("  o/c    gripper open / close")
     print("  [/]    speed down / up")
     print("  x      quit")
@@ -96,6 +100,10 @@ def main():
                 ctrl.go_home()
                 show_pose(ctrl)
 
+            elif key == 't':
+                ctrl.go_relax()
+                show_pose(ctrl)
+
             elif key == 'o':
                 ctrl.gripper_ctrl(70)
                 print("  Gripper opened")
@@ -114,9 +122,11 @@ def main():
 
     finally:
         print()
-        print("  Going home ...", end=" ", flush=True)
+        print("  Relaxing before exit (safe -> elbow -> relax) ...", end=" ", flush=True)
         try:
-            ctrl.send_joints(HOME_POSITION, timeout=8.0)
+            ctrl.send_joints(SAFE_POSITION, timeout=8.0)
+            ctrl.send_joints([0.0, 0.0, JOINT_LOWER[2], 0.0, 0.0, 0.0], timeout=8.0)
+            ctrl.send_joints(RELAX_POSITION, timeout=8.0)
             print("Done")
         except Exception:
             print("Skipped")

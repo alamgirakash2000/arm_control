@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Piper Arm Direct Controller (No ROS/MoveIt)
-============================================
-Uses DH-parameter-based FK and Jacobian IK to control the Piper arm
-directly via piper_sdk over CAN bus.
+Piper Arm Hanging Controller (Upside-Down Mount)
+=================================================
+Same as piper_direct.py but for arms mounted upside down (hanging).
+Home position is the midpoint of every joint's range, giving maximum
+reachability in all directions — like human arms hanging from shoulders.
 
 Usage:
-    python3 piper_direct.py              # Interactive mode
-    python3 piper_direct.py --can can0   # Specify CAN port
-    python3 piper_direct.py 5 0 3        # One-shot: dx=5cm, dz=3cm
+    python3 piper_hanging.py              # Interactive mode
+    python3 piper_hanging.py --can can0   # Specify CAN port
+    python3 piper_hanging.py 5 0 3        # One-shot: dx=5cm, dz=3cm
 """
 
 import sys
@@ -37,13 +38,37 @@ DH_THETA_OFFSET = [
 JOINT_LOWER = [-2.618, 0.0, -2.967, -1.745, -1.22, -2.0944]
 JOINT_UPPER = [2.618, 3.14, 0.0, 1.745, 1.22, 2.0944]
 
-HOME_POSITION = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# HOME = midpoint of each joint's range (hanging posture)
+#   Joint 1: 0.0       (centered)
+#   Joint 2: 1.57 rad  (90 deg — shoulder mid-range)
+#   Joint 3: -1.48 rad (-85 deg — elbow mid-range)
+#   Joint 4: 0.0       (centered)
+#   Joint 5: 0.0       (centered)
+#   Joint 6: 0.0       (centered)
+HOME_POSITION = [(lo + hi) / 2.0 for lo, hi in zip(JOINT_LOWER, JOINT_UPPER)]
+
+# RELAX = arm fully hanging down (elbow at max bend, everything else zero)
+#   Joint 3 at lower limit (-2.967 rad) = max elbow bend, arm dangles
+RELAX_POSITION = [0.0, math.pi / 2, JOINT_LOWER[2], 0.0, 0.0, 0.0]
+
+# Safe waypoint — all joints zero (piper_direct home).
+# Always pass through this before going to HOME or RELAX.
+SAFE_POSITION = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 # Conversion: radians <-> 0.001 degrees (piper_sdk unit)
 RAD_TO_MDEG = 1000.0 * 180.0 / math.pi  # ≈ 57295.78
 
-# FK reference at zero joints (from piper_sdk, in meters)
-FK_ZERO_REFERENCE = [0.056128, 0.0, 0.213266]
+# Base transform for upside-down mount: 180° rotation around X.
+# Flips Y and Z so that +Z = UP in the real world.
+T_BASE = np.array([
+    [1,  0,  0, 0],
+    [0, -1,  0, 0],
+    [0,  0, -1, 0],
+    [0,  0,  0, 1],
+], dtype=float)
+
+# FK reference at hanging home (computed from DH + T_BASE)
+FK_HOME_REFERENCE = [0.380093, 0.0, -0.427679]
 
 
 # ============================================================
@@ -62,18 +87,9 @@ def dh_transform(alpha, a, d, theta):
     ])
 
 
-def forward_kinematics(q):
-    """
-    Compute FK for the Piper arm.
-
-    Args:
-        q: list of 6 joint angles (radians)
-
-    Returns:
-        T_ee: 4x4 end-effector transform (base frame)
-        transforms: [T_00, T_01, T_02, T_03, T_04, T_05, T_06]
-    """
-    transforms = [np.eye(4)]  # T_00 = identity (base frame)
+def _raw_fk(q):
+    """FK in the robot's own base frame (no base flip)."""
+    transforms = [np.eye(4)]
     T = np.eye(4)
     for i in range(6):
         theta = q[i] + DH_THETA_OFFSET[i]
@@ -83,14 +99,32 @@ def forward_kinematics(q):
     return transforms[6], transforms
 
 
+def forward_kinematics(q):
+    """
+    Compute FK for the hanging Piper arm (world frame).
+
+    Applies T_BASE (180° X flip) so that +Z = UP in the real world.
+
+    Args:
+        q: list of 6 joint angles (radians)
+
+    Returns:
+        T_ee: 4x4 end-effector transform (world frame)
+        transforms: [T_00, T_01, ..., T_06] in world frame
+    """
+    _, raw_transforms = _raw_fk(q)
+    transforms = [T_BASE @ T for T in raw_transforms]
+    return transforms[6], transforms
+
+
 def verify_fk():
-    """Verify FK at zero joints against known SDK reference."""
+    """Verify FK at hanging home against known reference."""
     T_ee, _ = forward_kinematics(HOME_POSITION)
     pos = T_ee[:3, 3]
-    ref = np.array(FK_ZERO_REFERENCE)
+    ref = np.array(FK_HOME_REFERENCE)
     err = np.linalg.norm(pos - ref)
     if err > 0.001:
-        print(f"  WARNING: FK mismatch at home! Got {pos}, expected {ref}, err={err:.4f}m")
+        print(f"  WARNING: FK mismatch! Got {pos}, expected {ref}, err={err:.4f}m")
         return False
     return True
 
@@ -130,20 +164,18 @@ def euler_to_rotation(roll, pitch, yaw):
 
 def compute_jacobian(q):
     """
-    Compute 6x6 geometric Jacobian.
+    Compute 6x6 geometric Jacobian in world frame (base-flipped).
 
-    Returns J where [v; omega] = J * dq, expressed in base frame.
-
-    In this Modified DH convention, joint i's axis is the z-axis of
-    frame i (transforms[i+1]), not frame i-1.
+    Returns J where [v; omega] = J * dq, expressed in world frame.
+    +Z = UP when robot is hanging upside-down.
     """
-    _, transforms = forward_kinematics(q)
+    _, transforms = forward_kinematics(q)  # already in world frame
     p_ee = transforms[6][:3, 3]
 
     J = np.zeros((6, 6))
     for i in range(6):
-        z_i = transforms[i + 1][:3, 2]  # z-axis of frame i (1-indexed)
-        p_i = transforms[i + 1][:3, 3]  # origin of frame i
+        z_i = transforms[i + 1][:3, 2]
+        p_i = transforms[i + 1][:3, 3]
         J[:3, i] = np.cross(z_i, p_ee - p_i)  # linear
         J[3:, i] = z_i                          # angular
     return J
@@ -290,8 +322,8 @@ def ik_solve(q_init, target_pos, target_rot, max_iter=200, pos_tol=5e-4,
 # ROBOT INTERFACE
 # ============================================================
 
-class PiperDirectController:
-    """Direct controller for the Piper arm via piper_sdk (no ROS)."""
+class PiperHangingController:
+    """Controller for a Piper arm mounted upside-down (hanging)."""
 
     def __init__(self, can_port="can0"):
         self.piper = C_PiperInterface_V2(can_port)
@@ -330,12 +362,7 @@ class PiperDirectController:
         """Read current EE pose from firmware.
 
         Returns:
-            pos: [x, y, z] in meters> 10 20 10
-  Moving dx=10.0 dy=20.0 dz=10.0 cm ... unreachable
-
-> -10 
-  Moving dx=-10.0 dy=0.0 dz=0.0 cm ... unreachable
-
+            pos: [x, y, z] in meters
             rpy: [roll, pitch, yaw] in radians
         """
         msgs = self.piper.GetArmEndPoseMsgs()
@@ -474,10 +501,28 @@ class PiperDirectController:
             print("Timeout")
             return False
 
+    def go_safe(self):
+        """Move to safe waypoint (all zeros)."""
+        self.send_joints(SAFE_POSITION, timeout=8.0)
+
     def go_home(self):
-        """Move all joints to zero."""
-        print("  Going home ...", end=" ", flush=True)
+        """Safe waypoint -> mid-range home."""
+        print("  Going home (safe -> mid-range) ...", end=" ", flush=True)
+        self.go_safe()
         if self.send_joints(HOME_POSITION, timeout=8.0):
+            print("Done")
+        else:
+            print("Timeout")
+
+    def go_relax(self):
+        """Safe -> flex elbow -> relax."""
+        print("  Relaxing (safe -> elbow -> relax) ...", end=" ", flush=True)
+        self.go_safe()
+        # Flex elbow first (joint 3 only), shoulder stays at 0
+        elbow_first = [0.0, 0.0, JOINT_LOWER[2], 0.0, 0.0, 0.0]
+        self.send_joints(elbow_first, timeout=8.0)
+        # Then move shoulder to final relax
+        if self.send_joints(RELAX_POSITION, timeout=8.0):
             print("Done")
         else:
             print("Timeout")
@@ -518,9 +563,11 @@ def print_joints(ctrl):
 def interactive_mode(ctrl):
     print()
     print("=" * 55)
-    print("  PIPER ARM DIRECT CONTROLLER")
-    print("  (DH + Jacobian IK — no ROS/MoveIt)")
+    print("  PIPER ARM HANGING CONTROLLER")
+    print("  (Upside-down mount — mid-range home)")
     print("=" * 55)
+    print()
+    print(f"  Home joints (deg): {' '.join(f'{math.degrees(h):6.1f}' for h in HOME_POSITION)}")
     print()
     print("Commands:")
     print("  dx dy dz        Move by delta (cm)")
@@ -528,7 +575,8 @@ def interactive_mode(ctrl):
     print("  goto x y z      Move to absolute position (cm)")
     print("                  Example: goto 25 0 30")
     print("  goto x y z r p y  With orientation (degrees)")
-    print("  home            Move all joints to zero")
+    print("  home            Move to mid-range home")
+    print("  relax           Fully hang arm down (elbow max)")
     print("  pose            Print current EE pose")
     print("  joints          Print current joint angles")
     print("  speed 1-100     Set speed percentage")
@@ -553,6 +601,9 @@ def interactive_mode(ctrl):
 
             elif cmd == "home":
                 ctrl.go_home()
+
+            elif cmd == "relax":
+                ctrl.go_relax()
 
             elif cmd == "pose":
                 print_pose(ctrl)
@@ -643,20 +694,22 @@ def main():
             positional.append(sys.argv[i])
         i += 1
 
-    # Verify FK implementation
-    print("  Verifying FK ...", end=" ", flush=True)
+    print(f"  Home position (deg): {' '.join(f'{math.degrees(h):.1f}' for h in HOME_POSITION)}")
+
+    # Verify FK at hanging home
+    print("  Verifying FK (hanging) ...", end=" ", flush=True)
     if verify_fk():
         print("OK")
     else:
         print("MISMATCH (proceeding anyway)")
 
-    controller = PiperDirectController(can_port=can_port)
+    controller = PiperHangingController(can_port=can_port)
 
     if not controller.connect():
         print("  Failed to connect. Exiting.")
         sys.exit(1)
 
-    # Home on startup
+    # Home on startup — go to mid-range hanging posture
     controller.go_home()
 
     try:
@@ -668,9 +721,11 @@ def main():
         else:
             interactive_mode(controller)
     finally:
-        print("  Going home before exit ...", end=" ", flush=True)
+        print("  Relaxing before exit (safe -> elbow -> relax) ...", end=" ", flush=True)
         try:
-            controller.send_joints(HOME_POSITION, timeout=8.0)
+            controller.send_joints(SAFE_POSITION, timeout=8.0)
+            controller.send_joints([0.0, 0.0, JOINT_LOWER[2], 0.0, 0.0, 0.0], timeout=8.0)
+            controller.send_joints(RELAX_POSITION, timeout=8.0)
             print("Done")
         except Exception:
             print("Skipped")
