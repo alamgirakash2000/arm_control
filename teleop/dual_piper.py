@@ -17,11 +17,12 @@ import os
 import time
 import math
 import threading
-from piper_hanging import (
+from piper_core import (
     PiperHangingController,
     HOME_POSITION, RELAX_POSITION, SAFE_POSITION,
     JOINT_LOWER, JOINT_UPPER,
     verify_fk,
+    ik_solve, euler_to_rotation, forward_kinematics, joints_in_limits,
 )
 
 
@@ -59,6 +60,49 @@ def run_parallel(left_ctrl, right_ctrl, func_name, *args, **kwargs):
     return results
 
 
+def validate_delta(ctrl, dx, dy, dz, dr=0.0, dp=0.0, dyaw=0.0):
+    """
+    Check a 6DOF delta move with IK before sending to the robot.
+
+    Returns (ok: bool, message: str).
+    Rotation inputs are in radians.
+    """
+    cur_pos, cur_rpy = ctrl.read_pose()
+    q_current = ctrl.read_joints()
+
+    target_pos = [cur_pos[0] + dx, cur_pos[1] + dy, cur_pos[2] + dz]
+    target_rpy = [cur_rpy[0] + dr, cur_rpy[1] + dp, cur_rpy[2] + dyaw]
+    target_rot = euler_to_rotation(*target_rpy)
+
+    q_sol = ik_solve(q_current, target_pos, target_rot)
+    if q_sol is None:
+        return False, "IK failed — target unreachable or near singularity"
+
+    if not joints_in_limits(q_sol):
+        return False, "IK solution exceeds joint limits"
+
+    # FK round-trip: verify the solution actually reaches the target
+    T_check, _ = forward_kinematics(q_sol)
+    pos_err = math.sqrt(sum((target_pos[i] - T_check[i, 3]) ** 2 for i in range(3)))
+    if pos_err > 0.01:
+        return False, f"IK diverged — position error {pos_err * 100:.1f} cm"
+
+    return True, "OK"
+
+
+def move_delta_6(ctrl, dx, dy, dz, dr, dp, dyaw):
+    """Validate a 6DOF delta then execute it via move_to."""
+    ok, msg = validate_delta(ctrl, dx, dy, dz, dr, dp, dyaw)
+    if not ok:
+        print(f"  WARNING: {msg}")
+        return False
+    cur_pos, cur_rpy = ctrl.read_pose()
+    return ctrl.move_to(
+        cur_pos[0] + dx, cur_pos[1] + dy, cur_pos[2] + dz,
+        cur_rpy[0] + dr, cur_rpy[1] + dp, cur_rpy[2] + dyaw,
+    )
+
+
 def print_both_poses(left, right):
     lpos, lrpy = left.read_pose()
     rpos, rrpy = right.read_pose()
@@ -84,17 +128,20 @@ def interactive_mode(left, right):
     print(f"  Home (deg): {' '.join(f'{math.degrees(h):6.1f}' for h in HOME_POSITION)}")
     print()
     print("Commands (sent to BOTH arms):")
-    print("  dx dy dz        Move by delta (cm)")
-    print("  goto x y z      Move to position (cm)")
-    print("  home            Go to mid-range home")
-    print("  relax           Hang arms down")
-    print("  pose            Print EE poses")
-    print("  joints          Print joint angles")
-    print("  speed 1-100     Set speed")
-    print("  gripper open    Open grippers")
-    print("  gripper close   Close grippers")
-    print("  gripper <mm>    Set gripper opening")
-    print("  quit            Exit")
+    print("  dx dy dz              Move by position delta (cm)")
+    print("  dx dy dz dr dp dyaw   Move by full 6DOF delta (cm + deg, validated)")
+    print("  left  dx dy dz [dr dp dyaw]   Move LEFT arm only")
+    print("  right dx dy dz [dr dp dyaw]   Move RIGHT arm only")
+    print("  goto x y z            Move to position (cm)")
+    print("  home                  Go to mid-range home")
+    print("  relax                 Hang arms down")
+    print("  pose                  Print EE poses")
+    print("  joints                Print joint angles")
+    print("  speed 1-100           Set speed")
+    print("  gripper open          Open grippers")
+    print("  gripper close         Close grippers")
+    print("  gripper <mm>          Set gripper opening")
+    print("  quit                  Exit")
     print()
     print("=" * 55)
 
@@ -174,8 +221,29 @@ def interactive_mode(left, right):
                 else:
                     print("Usage: goto x y z")
 
+            elif cmd in ("left", "right"):
+                # Per-arm delta move: left/right dx dy dz [dr dp dyaw]
+                tail = parts[1:]
+                if len(tail) == 3:
+                    dx = float(tail[0]) / 100.0
+                    dy = float(tail[1]) / 100.0
+                    dz = float(tail[2]) / 100.0
+                    ctrl = left if cmd == "left" else right
+                    ctrl.move_delta(dx, dy, dz)
+                elif len(tail) == 6:
+                    dx  = float(tail[0]) / 100.0
+                    dy  = float(tail[1]) / 100.0
+                    dz  = float(tail[2]) / 100.0
+                    dr  = math.radians(float(tail[3]))
+                    dp  = math.radians(float(tail[4]))
+                    dyw = math.radians(float(tail[5]))
+                    ctrl = left if cmd == "left" else right
+                    move_delta_6(ctrl, dx, dy, dz, dr, dp, dyw)
+                else:
+                    print(f"Usage: {cmd} dx dy dz [dr dp dyaw]")
+
             else:
-                # Delta move
+                # Both-arms delta move
                 if len(parts) == 3:
                     dx = float(parts[0]) / 100.0
                     dy = float(parts[1]) / 100.0
@@ -186,6 +254,27 @@ def interactive_mode(left, right):
                     t2.start()
                     t1.join()
                     t2.join()
+                elif len(parts) == 6:
+                    dx  = float(parts[0]) / 100.0
+                    dy  = float(parts[1]) / 100.0
+                    dz  = float(parts[2]) / 100.0
+                    dr  = math.radians(float(parts[3]))
+                    dp  = math.radians(float(parts[4]))
+                    dyw = math.radians(float(parts[5]))
+                    # Validate both arms before moving either
+                    lok, lmsg = validate_delta(left,  dx, dy, dz, dr, dp, dyw)
+                    rok, rmsg = validate_delta(right, dx, dy, dz, dr, dp, dyw)
+                    if not lok:
+                        print(f"  LEFT  WARNING: {lmsg}")
+                    if not rok:
+                        print(f"  RIGHT WARNING: {rmsg}")
+                    if lok and rok:
+                        t1 = threading.Thread(target=move_delta_6, args=(left,  dx, dy, dz, dr, dp, dyw))
+                        t2 = threading.Thread(target=move_delta_6, args=(right, dx, dy, dz, dr, dp, dyw))
+                        t1.start()
+                        t2.start()
+                        t1.join()
+                        t2.join()
                 elif len(parts) == 1:
                     dx = float(parts[0]) / 100.0
                     t1 = threading.Thread(target=left.move_delta, args=(dx, 0, 0))
@@ -195,7 +284,7 @@ def interactive_mode(left, right):
                     t1.join()
                     t2.join()
                 else:
-                    print("Enter: dx dy dz  (e.g., 5 0 3)")
+                    print("Enter: dx dy dz [dr dp dyaw]  (e.g., 5 0 3  or  5 0 3 0 10 0)")
 
         except ValueError:
             print("Invalid input. Enter numbers like: 5 0 3")
