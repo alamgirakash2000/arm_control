@@ -11,6 +11,7 @@ Usage:
 """
 
 import sys
+import math
 import tty
 import termios
 from piper_hanging import (
@@ -19,6 +20,7 @@ from piper_hanging import (
 )
 
 STEP = 0.01  # 1cm in meters
+ROT_STEP = math.radians(5)  # 5° per keypress
 
 # key -> (dx, dy, dz) direction
 KEY_MAP = {
@@ -28,6 +30,16 @@ KEY_MAP = {
     'd': ( 0, -1,  0),   # -Y right
     'q': ( 0,  0,  1),   # +Z up  (real world up, thanks to T_BASE flip)
     'e': ( 0,  0, -1),   # -Z down
+}
+
+# key -> (droll, dpitch, dyaw) direction
+ROT_KEY_MAP = {
+    'n': ( 1,  0,  0),   # +roll
+    'm': (-1,  0,  0),   # -roll
+    'i': ( 0,  1,  0),   # +pitch
+    'k': ( 0, -1,  0),   # -pitch
+    'j': ( 0,  0,  1),   # +yaw
+    'l': ( 0,  0, -1),   # -yaw
 }
 
 
@@ -44,10 +56,12 @@ def get_key():
 
 
 def show_pose(ctrl):
-    pos, _ = ctrl.read_pose()
+    pos, rpy = ctrl.read_pose()
+    r, p, y = [math.degrees(a) for a in rpy]
     print(
-        f"  Pose: x={pos[0]*100:6.1f}  y={pos[1]*100:6.1f}  z={pos[2]*100:6.1f} cm"
-        f"  |  speed={ctrl.speed}%"
+        f"  Pos: x={pos[0]*100:5.1f} y={pos[1]*100:5.1f} z={pos[2]*100:5.1f} cm"
+        f"  RPY: {r:5.1f} {p:5.1f} {y:5.1f}°"
+        f"  | spd={ctrl.speed}%"
     )
 
 
@@ -75,6 +89,9 @@ def main():
     print("  w/s    +X / -X  (forward / backward)")
     print("  a/d    +Y / -Y  (left / right)")
     print("  q/e    +Z / -Z  (up / down)")
+    print("  i/k    +pitch / -pitch")
+    print("  j/l    +yaw / -yaw")
+    print("  n/m    +roll / -roll")
     print("  r      home     (safe -> mid-range)")
     print("  t      relax    (safe -> elbow -> hang)")
     print("  o/c    gripper open / close")
@@ -94,6 +111,17 @@ def main():
             elif key in KEY_MAP:
                 dx, dy, dz = KEY_MAP[key]
                 ctrl.move_delta(dx * STEP, dy * STEP, dz * STEP)
+                show_pose(ctrl)
+
+            elif key in ROT_KEY_MAP:
+                dr, dp, dy = ROT_KEY_MAP[key]
+                pos, rpy = ctrl.read_pose()
+                ctrl.move_to(
+                    pos[0], pos[1], pos[2],
+                    rpy[0] + dr * ROT_STEP,
+                    rpy[1] + dp * ROT_STEP,
+                    rpy[2] + dy * ROT_STEP,
+                )
                 show_pose(ctrl)
 
             elif key == 'r':

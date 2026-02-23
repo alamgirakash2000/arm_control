@@ -60,18 +60,19 @@ try:
 except ImportError:
     _cv2_ok = False
 
-
 # ── Default configuration (override via CLI) ───────────────────────────────────
 
-DEFAULT_IP       = "10.0.0.143"   # Vision Pro IP — check Settings → Wi-Fi
+#DEFAULT_IP       = "10.0.0.143"   # Vision Pro IP — check Settings → Wi-Fi
+DEFAULT_IP       = "10.130.17.123"   # Vision Pro IP — check Settings → Wi-Fi
 DEFAULT_SCALE    = 1.0            # 1.0 = 1:1,  0.5 = half range,  2.0 = double
-DEFAULT_SPEED    = 20             # Robot speed % — start low, raise once OK
+DEFAULT_ROT_SCALE = 0.0           # 0.0 = position only, 0.1 = gentle, 1.0 = full rotation
+DEFAULT_SPEED    = 50             # Robot speed % — start low, raise once OK
 GRIPPER_MAX_MM   = 70.0           # Gripper fully-open distance in mm
 GRIPPER_DEADBAND = 2.0            # % — only send gripper cmd when Δ > this
 DEADBAND_CM      = 1.0            # cm  — tremor suppression for position
 DEADBAND_DEG     = 2.0            # deg — tremor suppression for rotation
 PINCH_MAX_M      = 0.08           # m   — pinch distance that maps to 100% open
-POLL_HZ          = 90             # Hz  — Vision Pro polling rate
+POLL_HZ          = 10             # Hz  — Vision Pro polling rate
 DISPLAY_HZ       = 30             # Hz  — terminal / overlay refresh rate
 
 # ── Axis remapping ─────────────────────────────────────────────────────────────
@@ -216,7 +217,11 @@ Examples:
     )
     p.add_argument(
         "--scale", default=DEFAULT_SCALE, type=float,
-        help=f"Motion scale 0.1-2.0  (default: {DEFAULT_SCALE})",
+        help=f"Position scale 0.1-2.0  (default: {DEFAULT_SCALE})",
+    )
+    p.add_argument(
+        "--rot_scale", default=DEFAULT_ROT_SCALE, type=float,
+        help=f"Rotation scale 0.0-1.0  (0=position only, default: {DEFAULT_ROT_SCALE})",
     )
     p.add_argument(
         "--speed", default=DEFAULT_SPEED, type=int,
@@ -402,6 +407,7 @@ def countdown(seconds, label, streamer):
 def main():
     args       = parse_args()
     scale      = max(0.1, min(2.0, args.scale))
+    rot_scale  = max(0.0, min(1.0, args.rot_scale))
     with_robot = args.with_robot
 
     _disp["scale"] = scale
@@ -413,7 +419,8 @@ def main():
     print("=" * 60)
     print(f"  Vision Pro : {args.ip}")
     print(f"  Mode       : {'ROBOT (CAN active)' if with_robot else 'SIMULATION  (no robot motion)'}")
-    print(f"  Scale      : {scale}    Deadband: {DEADBAND_CM} cm / {DEADBAND_DEG} deg")
+    print(f"  Scale      : pos={scale}  rot={rot_scale}{'  (position only)' if rot_scale == 0 else ''}")
+    print(f"  Deadband   : {DEADBAND_CM} cm / {DEADBAND_DEG} deg")
     if with_robot:
         print(f"  Speed      : {args.speed} %")
     print(f"  Overlay    : {'cv2 ready' if _cv2_ok else 'terminal only  (pip install opencv-python)'}")
@@ -424,16 +431,23 @@ def main():
     if with_robot:
         left_can  = args.left
         right_can = args.right
-        if left_can is None or right_can is None:
+        # Only auto-detect if NEITHER was specified on CLI
+        if left_can is None and right_can is None:
             auto_l, auto_r = get_can_ports()
-            if left_can  is None: left_can  = auto_l
-            if right_can is None: right_can = auto_r
-        if not left_can or not right_can:
-            print("  ERROR: Cannot determine CAN ports.")
+            left_can  = auto_l
+            right_can = auto_r
+        if not left_can and not right_can:
+            print("  ERROR: Cannot determine any CAN ports.")
             print("  Run:  sudo bash start_teleop.sh")
             print("  Or:   --with_robot --left can0 --right can1")
             sys.exit(1)
-        print(f"  CAN  : LEFT={left_can}   RIGHT={right_can}")
+        parts = []
+        if left_can:  parts.append(f"LEFT={left_can}")
+        if right_can: parts.append(f"RIGHT={right_can}")
+        print(f"  CAN  : {'   '.join(parts)}")
+        if not left_can or not right_can:
+            missing = "RIGHT" if not right_can else "LEFT"
+            print(f"  NOTE : {missing} arm not connected — tracking only")
         print()
 
     # ── Precompute robot home reference ────────────────────────────────────────
@@ -497,40 +511,45 @@ def main():
     if with_robot:
         from piper_core import PiperHangingController
 
-        left_ctrl  = PiperHangingController(can_port=left_can)
-        right_ctrl = PiperHangingController(can_port=right_can)
-
         print("  Connecting arms ...")
-        results = [False, False]
+        threads = []
 
-        def _cl(): results[0] = left_ctrl.connect()
-        def _cr(): results[1] = right_ctrl.connect()
+        if left_can:
+            left_ctrl = PiperHangingController(can_port=left_can)
+            def _cl(): left_ctrl._conn_ok = left_ctrl.connect()
+            t = threading.Thread(target=_cl); t.start(); threads.append(t)
 
-        t1 = threading.Thread(target=_cl)
-        t2 = threading.Thread(target=_cr)
-        t1.start(); t2.start(); t1.join(); t2.join()
+        if right_can:
+            right_ctrl = PiperHangingController(can_port=right_can)
+            def _cr(): right_ctrl._conn_ok = right_ctrl.connect()
+            t = threading.Thread(target=_cr); t.start(); threads.append(t)
 
-        if not results[0]:
+        for t in threads: t.join()
+
+        if left_ctrl and not getattr(left_ctrl, '_conn_ok', False):
             print("  LEFT arm failed to connect - aborting.")
             sys.exit(1)
-        if not results[1]:
+        if right_ctrl and not getattr(right_ctrl, '_conn_ok', False):
             print("  RIGHT arm failed to connect - aborting.")
-            left_ctrl.shutdown()
+            if left_ctrl: left_ctrl.shutdown()
             sys.exit(1)
 
-        left_ctrl.speed  = args.speed
-        right_ctrl.speed = args.speed
+        if left_ctrl:  left_ctrl.speed  = args.speed
+        if right_ctrl: right_ctrl.speed = args.speed
 
-        print("  Homing both arms ...")
-        t1 = threading.Thread(target=left_ctrl.go_home)
-        t2 = threading.Thread(target=right_ctrl.go_home)
-        t1.start(); t2.start(); t1.join(); t2.join()
+        print("  Homing arms ...")
+        threads = []
+        if left_ctrl:
+            t = threading.Thread(target=left_ctrl.go_home); t.start(); threads.append(t)
+        if right_ctrl:
+            t = threading.Thread(target=right_ctrl.go_home); t.start(); threads.append(t)
+        for t in threads: t.join()
         print("  Arms ready.")
         print()
 
         # Non-blocking commanders — main loop never stalls on CAN
-        left_cmd  = ArmCommander(left_ctrl,  "left")
-        right_cmd = ArmCommander(right_ctrl, "right")
+        if left_ctrl:  left_cmd  = ArmCommander(left_ctrl,  "left")
+        if right_ctrl: right_cmd = ArmCommander(right_ctrl, "right")
 
     # ── IK warm-start joint tracker ───────────────────────────────────────────
     left_joints  = list(HOME_POSITION)
@@ -567,9 +586,9 @@ def main():
                 # Rotation delta: R_delta = R_cur @ R_home.T
                 Rd_L       = rotation_delta(cur_L[:3, :3], home_L[:3, :3])
                 rL, pL, yL = rotation_to_euler(Rd_L)
-                dr_L   = deadband(math.degrees(rL), DEADBAND_DEG)
-                dp_L   = deadband(math.degrees(pL), DEADBAND_DEG)
-                dyaw_L = deadband(math.degrees(yL), DEADBAND_DEG)
+                dr_L   = deadband(math.degrees(rL) * rot_scale, DEADBAND_DEG)
+                dp_L   = deadband(math.degrees(pL) * rot_scale, DEADBAND_DEG)
+                dyaw_L = deadband(math.degrees(yL) * rot_scale, DEADBAND_DEG)
 
                 pinch_L   = data.left.pinch_distance
                 gripper_L = min(100.0, pinch_L / PINCH_MAX_M * 100)
@@ -587,9 +606,9 @@ def main():
 
                 Rd_R       = rotation_delta(cur_R[:3, :3], home_R[:3, :3])
                 rR, pR, yR = rotation_to_euler(Rd_R)
-                dr_R   = deadband(math.degrees(rR), DEADBAND_DEG)
-                dp_R   = deadband(math.degrees(pR), DEADBAND_DEG)
-                dyaw_R = deadband(math.degrees(yR), DEADBAND_DEG)
+                dr_R   = deadband(math.degrees(rR) * rot_scale, DEADBAND_DEG)
+                dp_R   = deadband(math.degrees(pR) * rot_scale, DEADBAND_DEG)
+                dyaw_R = deadband(math.degrees(yR) * rot_scale, DEADBAND_DEG)
 
                 pinch_R   = data.right.pinch_distance
                 gripper_R = min(100.0, pinch_R / PINCH_MAX_M * 100)
