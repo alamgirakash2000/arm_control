@@ -10,24 +10,15 @@ sudo apt install can-utils
 ```
 
 ## Connect the Physical Robot
-
-1. Plug in the Piper arm via USB-CAN adapter.
-
-2. Activate the CAN interface:
 ```bash
-sudo ip link set can0 down && sudo ip link set can0 up
+sudo bash setup.sh 
 ```
 
-3. Verify the connection:
-```bash
-candump can0    # should show CAN frames scrolling
-```
-Press Ctrl+C to stop.
 
 ## Run
 
 ```bash
-python3 piper_direct.py
+python3 single_arm.py
 ```
 
 The robot will home (all joints to zero), then you get an interactive prompt.
@@ -36,8 +27,7 @@ The robot will home (all joints to zero), then you get an interactive prompt.
 ## Running Dual Arms
 
 ```bash
-sudo bash piper_setup.sh 
-python3 piper_hanging_dual.py
+python3 dual_arm.py
 ```
 
 
@@ -45,9 +35,10 @@ python3 piper_hanging_dual.py
 ## Keyboard Controller
 
 ```bash
-python3 piper_keyboard_hanging.py
+python single_keyboard.py
 ```
 ```
+
 ==================================================
   KEYBOARD CONTROL — HANGING  (1cm per press)
 ==================================================
@@ -62,13 +53,3 @@ python3 piper_keyboard_hanging.py
 ==================================================
 
 ```
-
-## Troubleshooting
-
-**"FAILED (timeout enabling)"** — CAN interface not active. Run `can_activate.sh` again.
-
-**"Timeout" on moves** — Target may be outside the robot's workspace. Try a smaller move.
-
-**Permission denied on CAN** — Run `can_activate.sh` with `sudo`.
-
-**candump shows nothing** — Check USB cable, power to the robot, and that the correct CAN port name is used.
