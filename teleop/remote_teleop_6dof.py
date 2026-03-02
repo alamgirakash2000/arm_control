@@ -45,6 +45,9 @@ from piper_core import (
     HOME_POSITION,
     JOINT_LOWER,
     JOINT_UPPER,
+    ik_solve,
+    T_BASE,
+    RAD_TO_MDEG,
 )
 
 from relay_server import pose_store, start_server
@@ -60,21 +63,27 @@ except ImportError:
 
 DEFAULT_SCALE      = 1.0
 DEFAULT_ROT_SCALE  = 1.0
-DEFAULT_SPEED      = 70
-DEFAULT_SMOOTHING  = 0.9
-GRIPPER_MAX_MM     = 70.0
+DEFAULT_SPEED      = 50
+DEFAULT_SMOOTHING  = 0.5
+GRIPPER_MAX_MM     = 40.0
 GRIPPER_DEADBAND   = 2.0      # %
 DEADBAND_CM        = 0.0      # cm — per-axis EMA deadband
-MOVE_THRESH_CM     = 2.0      # cm — per-axis position threshold
-ROT_THRESH_DEG     = 3.0      # deg — per-axis rotation threshold
-UPDATE_INTERVAL    = 0.1      # seconds between accepting new targets (10 Hz)
+MOVE_THRESH_CM     = 0.0      # cm — per-axis position threshold (0 = always update)
+ROT_THRESH_DEG     = 0.0      # deg — rotation threshold (0 = always update)
+UPDATE_INTERVAL    = 0.025    # seconds between accepting new targets (40 Hz)
 HOLD_HZ            = 30       # Hz — rate to resend current target
-DISPLAY_HZ         = 6        # terminal print rate
-REF_SECS           = 5.0      # seconds to average for home pose capture
+DISPLAY_HZ         = 10        # terminal print rate
+REF_SECS           = 2.5      # seconds to average for home pose capture
 STALE_MS           = 500.0    # pose data older than this = tracking lost
 MAX_POS_DELTA_CM   = 100.0    # generous backstop (joint limits are the real safety)
 MAX_ROT_DELTA_DEG  = 180.0    # generous backstop (joint limits are the real safety)
-JOINT_LIMIT_MARGIN = math.radians(5.0)  # 5° fixed margin from each joint limit
+JOINT_LIMIT_MARGIN = math.radians(2.0)  # 2° fixed margin from each joint limit
+
+# IK joint-space smoothing: per-joint EMA rate (0=frozen, 1=instant)
+# J4 (forearm twist) tracks slower to prevent slamming into limits
+IK_JOINT_ALPHA   = [0.35, 0.35, 0.35, 0.2, 0.35, 0.35]
+# IK joint weights: higher = joint moves less (penalizes J4 2x)
+IK_JOINT_WEIGHTS = [1.0, 1.0, 1.0, 2.0, 1.0, 1.0]
 
 # ── VR-to-Robot frame transform ──────────────────────────────────────────────
 # OpenVR: X=right, Y=up, −Z=forward
@@ -93,6 +102,9 @@ VR_TO_ROBOT = np.array([
 
 # Position axis remap (same mapping, used for position deltas)
 AXIS_MAP = [(1, 1), (0, 1), (2, -1)]
+
+# Rotation part of upside-down base transform (native ↔ FK world frame)
+T_BASE_ROT = np.diag([1.0, -1.0, -1.0])
 
 # ── ANSI helpers ──────────────────────────────────────────────────────────────
 GREEN  = "\033[32m"
@@ -227,6 +239,16 @@ def scale_rotation(R, s):
     return np.eye(3) + math.sin(new_angle) * K + (1 - math.cos(new_angle)) * (K @ K)
 
 
+def native_to_world_pose(pos, R):
+    """Convert position + rotation from firmware native frame to FK world frame.
+
+    T_BASE_ROT = diag(1,-1,-1) is a 180° X rotation — its own inverse.
+    """
+    pos_w = T_BASE_ROT @ np.asarray(pos, dtype=np.float64)
+    R_w = T_BASE_ROT @ R @ T_BASE_ROT
+    return list(pos_w), R_w
+
+
 # ── Non-blocking robot commander ─────────────────────────────────────────────
 
 class ArmCommander:
@@ -235,15 +257,23 @@ class ArmCommander:
         self._speed   = ctrl.speed
         self._lock    = threading.Lock()
         self._target  = None          # (x, y, z, roll, pitch, yaw) or None
+        self._joint_target = None     # [q1..q6] or None
         self._grip_mm = None
         self._running = True
         self._label   = label
         threading.Thread(target=self._loop, daemon=True, name=f"cmd-{label}").start()
 
     def send(self, x, y, z, roll, pitch, yaw):
-        """Update the target pose (called from main loop)."""
+        """Update the Cartesian target pose (firmware IK mode)."""
         with self._lock:
             self._target = (x, y, z, roll, pitch, yaw)
+            self._joint_target = None
+
+    def send_joints(self, q):
+        """Update the joint target (local IK mode)."""
+        with self._lock:
+            self._joint_target = [float(v) for v in q]
+            self._target = None
 
     def gripper(self, mm: float):
         with self._lock:
@@ -257,8 +287,16 @@ class ArmCommander:
         while self._running:
             with self._lock:
                 tgt = self._target
+                jtgt = self._joint_target
                 grip = self._grip_mm
-            if tgt is not None:
+            if jtgt is not None:
+                try:
+                    jcmds = [round(q * RAD_TO_MDEG) for q in jtgt]
+                    self._piper.MotionCtrl_2(0x01, 0x01, self._speed, 0x00)
+                    self._piper.JointCtrl(*jcmds)
+                except Exception:
+                    pass
+            elif tgt is not None:
                 try:
                     x, y, z, roll, pitch, yaw = tgt
                     self._piper.MotionCtrl_2(0x01, 0x00, self._speed, 0x00)
@@ -296,6 +334,10 @@ def parse_args():
     p.add_argument("--speed",          default=DEFAULT_SPEED, type=int)
     p.add_argument("--smoothing",      default=DEFAULT_SMOOTHING, type=float)
     p.add_argument("--ref-secs",       default=REF_SECS, type=float)
+    p.add_argument("--joint-ik",      action="store_true", default=True,
+                   help="Use local IK + joint control (default: on)")
+    p.add_argument("--no-joint-ik",   action="store_true",
+                   help="Disable local IK, use firmware Cartesian control")
     p.add_argument("--invert-gripper", action="store_true")
     p.add_argument("--port",           default=8765, type=int)
     p.add_argument("--host",           default="0.0.0.0")
@@ -492,6 +534,7 @@ def main():
     with_robot  = args.with_robot
     alpha       = float(np.clip(args.smoothing, 0.0, 1.0))
     invert_grip = bool(args.invert_gripper)
+    ik_mode     = (args.joint_ik and not args.no_joint_ik) and with_robot
     rot_thresh  = math.radians(ROT_THRESH_DEG)
 
     P  = VR_TO_ROBOT
@@ -539,6 +582,7 @@ def main():
     print(f"  Hold: {HOLD_HZ} Hz   Update: every {UPDATE_INTERVAL}s")
     print(f"  Thresh pos : {MOVE_THRESH_CM} cm    rot: {ROT_THRESH_DEG}°")
     print(f"  Joint prot : {math.degrees(JOINT_LIMIT_MARGIN):.0f}° margin (reactive monitoring)")
+    print(f"  IK mode    : {'LOCAL (joint ctrl, J2/J3 compensation)' if ik_mode else 'FIRMWARE (Cartesian ctrl)'}")
     print(f"  Smoothing  : {alpha}")
     if with_robot:
         print(f"  Speed      : {args.speed} %")
@@ -610,6 +654,10 @@ def main():
     T_home, _ = forward_kinematics(HOME_POSITION)
     fk_rpy = list(rotation_to_euler(T_home[:3, :3]))
     fk_pos = list(T_home[:3, 3])
+
+    # FK home in world frame (for IK mode — avoids firmware/FK mismatch)
+    ik_home_pos_w = np.array(fk_pos, dtype=np.float64)
+    ik_home_R_w   = T_home[:3, :3].copy()
 
     robot_home = {}
     for h in active_hands:
@@ -694,6 +742,14 @@ def main():
     at_limit   = {h: False for h in active_hands}
     limit_info = {h: [] for h in active_hands}
     max_pos_d = MAX_POS_DELTA_CM
+    # Joint IK state (seed with current joint positions after homing)
+    last_ik_q = {}
+    cmd_q     = {}   # smoothed joint commands (separate from IK seed)
+    if ik_mode:
+        for h in active_hands:
+            q0 = ctrls[h].read_joints() if h in ctrls else list(HOME_POSITION)
+            last_ik_q[h] = list(q0)
+            cmd_q[h]     = list(q0)
 
     frame_num   = 0
     last_update = 0.0
@@ -814,10 +870,28 @@ def main():
                 tgt_rpy = rotation_to_euler(R_target)
 
                 if with_robot and hand in cmds:
-                    cmds[hand].send(
-                        tgt_pos[0], tgt_pos[1], tgt_pos[2],
-                        tgt_rpy[0], tgt_rpy[1], tgt_rpy[2],
-                    )
+                    if ik_mode:
+                        # Local IK: compute target in FK world frame directly
+                        # (avoids firmware FK ↔ our FK mismatch)
+                        delta_m = np.array([clamped_pos[j] / 100.0 for j in range(3)])
+                        pos_w = list(ik_home_pos_w + T_BASE_ROT @ delta_m)
+                        R_delta_w = T_BASE_ROT @ com_R[hand] @ T_BASE_ROT
+                        R_w = R_delta_w @ ik_home_R_w
+                        q_sol = ik_solve(last_ik_q[hand], pos_w, R_w,
+                                         max_iter=50, pos_tol=1e-3, rot_tol=0.02,
+                                         margin=JOINT_LIMIT_MARGIN,
+                                         joint_weights=IK_JOINT_WEIGHTS)
+                        if q_sol is not None:
+                            last_ik_q[hand] = list(q_sol)  # unsmoothed seed
+                            for i in range(6):
+                                cmd_q[hand][i] += IK_JOINT_ALPHA[i] * (q_sol[i] - cmd_q[hand][i])
+                            cmds[hand].send_joints(cmd_q[hand])
+                    else:
+                        # Firmware IK: send Cartesian target
+                        cmds[hand].send(
+                            tgt_pos[0], tgt_pos[1], tgt_pos[2],
+                            tgt_rpy[0], tgt_rpy[1], tgt_rpy[2],
+                        )
                     cmds[hand].gripper(com_grip[hand] / 100.0 * GRIPPER_MAX_MM)
 
             # ── Display at DISPLAY_HZ ───────────────────────────────────────
@@ -867,9 +941,9 @@ def main():
                     if cv2.waitKey(1) == 27:
                         break
 
-            # ── Rate limit (~20 Hz) ─────────────────────────────────────────
+            # ── Rate limit (~40 Hz) ─────────────────────────────────────────
             elapsed = time.time() - t_start
-            sleep = 0.05 - elapsed
+            sleep = 0.025 - elapsed
             if sleep > 0:
                 time.sleep(sleep)
 

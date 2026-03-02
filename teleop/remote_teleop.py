@@ -65,7 +65,7 @@ MOVE_THRESH_CM    = 2.0     # cm — per-axis must change by this much to accept
 UPDATE_INTERVAL   = 0.1     # seconds between checking for new targets (10 Hz)
 HOLD_HZ           = 30      # Hz — rate to resend current target (keeps robot locked)
 DISPLAY_HZ        = 1       # terminal print rate
-REF_SECS          = 5.0     # seconds to average for home pose capture
+REF_SECS          = 10.0     # seconds to average for home pose capture
 STALE_MS          = 500.0   # pose data older than this = tracking lost
 
 # ── Axis remapping ────────────────────────────────────────────────────────────

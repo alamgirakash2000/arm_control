@@ -28,9 +28,9 @@ DH_THETA_OFFSET = [
     0,
 ]
 
-# Joint limits (radians) from URDF
-JOINT_LOWER = [-2.618, 0.0, -2.967, -1.745, -1.22, -2.0944]
-JOINT_UPPER = [ 2.618, 3.14,  0.0,   1.745,  1.22,  2.0944]
+# Joint limits (radians) from URDF (J5 extended to ±90° per physical verification)
+JOINT_LOWER = [-2.618, 0.0, -2.967, -1.745, -1.5708, -2.0944]
+JOINT_UPPER = [ 2.618, 3.14,  0.0,   1.745,  1.5708,  2.0944]
 
 # HOME = midpoint of each joint's range (hanging posture)
 HOME_POSITION  = [(lo + hi) / 2.0 for lo, hi in zip(JOINT_LOWER, JOINT_UPPER)]
@@ -207,25 +207,34 @@ def _rotation_error(R_target, R_current):
 
 
 def ik_solve(q_init, target_pos, target_rot, max_iter=200, pos_tol=5e-4,
-             rot_tol=1e-2, damping=0.05, step_limit=0.1):
+             rot_tol=1e-2, damping=0.05, step_limit=0.1, margin=0.0,
+             joint_weights=None):
     """
     Iterative damped-least-squares IK solver (full 6DOF).
 
     Args:
-        q_init:     starting joint angles (6,)
-        target_pos: desired [x, y, z] in meters
-        target_rot: desired 3x3 rotation matrix
-        max_iter:   maximum iterations
-        pos_tol:    position convergence threshold (meters)
-        rot_tol:    orientation convergence threshold (radians)
-        damping:    singularity damping factor
-        step_limit: max task-space step per iteration
+        q_init:       starting joint angles (6,)
+        target_pos:   desired [x, y, z] in meters
+        target_rot:   desired 3x3 rotation matrix
+        max_iter:     maximum iterations
+        pos_tol:      position convergence threshold (meters)
+        rot_tol:      orientation convergence threshold (radians)
+        damping:      singularity damping factor
+        step_limit:   max task-space step per iteration
+        margin:       safety margin (radians) inset from each joint limit
+        joint_weights: per-joint penalty [6] (higher = joint moves less)
 
     Returns:
         q_solution or None if failed
     """
     q          = list(q_init)
     target_pos = np.asarray(target_pos, dtype=float)
+
+    # Weighted DLS: higher weight = more penalty for that joint
+    if joint_weights is not None:
+        W_inv = np.diag([1.0 / w for w in joint_weights])
+    else:
+        W_inv = None
 
     for _ in range(max_iter):
         T_ee, _ = forward_kinematics(q)
@@ -244,11 +253,16 @@ def ik_solve(q_init, target_pos, target_rot, max_iter=200, pos_tol=5e-4,
             dx_vec = dx_vec * step_limit / step_norm
 
         J   = compute_jacobian(q)
-        JJT = J @ J.T + damping ** 2 * np.eye(6)
-        dq  = J.T @ np.linalg.solve(JJT, dx_vec)
+        if W_inv is not None:
+            JW  = J @ W_inv
+            A   = JW @ J.T + damping ** 2 * np.eye(6)
+            dq  = W_inv @ (J.T @ np.linalg.solve(A, dx_vec))
+        else:
+            JJT = J @ J.T + damping ** 2 * np.eye(6)
+            dq  = J.T @ np.linalg.solve(JJT, dx_vec)
 
-        q = [q[i] + dq[i] for i in range(6)]
-        q = clamp_joints(q)
+        q = [max(JOINT_LOWER[i] + margin, min(JOINT_UPPER[i] - margin, q[i] + dq[i]))
+             for i in range(6)]
 
     # Accept if position is close enough even if not fully converged
     T_ee, _ = forward_kinematics(q)

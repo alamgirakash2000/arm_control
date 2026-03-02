@@ -84,7 +84,7 @@ DEADBAND_DEG      = 2.0    # deg -- tremor suppression for rotation
 POLL_HZ           = 90     # Hz  -- main loop target rate
 DISPLAY_HZ        = 30     # Hz  -- terminal / cv2 refresh rate
 CONTROLLER_RESCAN_S = 3.0  # s   -- how often to re-scan for controller IDs
-REF_SECS          = 5.0    # s   -- seconds to average for home pose capture
+REF_SECS          = 2.5    # s   -- seconds to average for home pose capture
 
 # ── Axis remapping ─────────────────────────────────────────────────────────────
 # Format: (OpenVR_axis_index, sign) for each robot axis [x, y, z].
