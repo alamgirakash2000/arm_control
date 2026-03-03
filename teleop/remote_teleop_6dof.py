@@ -28,11 +28,15 @@ Robot command flow:
 """
 
 import argparse
+import json
 import math
 import os
+import select
 import sys
+import termios
 import time
 import threading
+import tty
 
 import numpy as np
 
@@ -52,11 +56,20 @@ from piper_core import (
 
 from relay_server import pose_store, start_server
 
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.*=false"
 try:
     import cv2
     _cv2_ok = True
 except ImportError:
     _cv2_ok = False
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    _arrow_ok = True
+except ImportError:
+    _arrow_ok = False
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -77,7 +90,7 @@ REF_SECS           = 2.5      # seconds to average for home pose capture
 STALE_MS           = 500.0    # pose data older than this = tracking lost
 MAX_POS_DELTA_CM   = 100.0    # generous backstop (joint limits are the real safety)
 MAX_ROT_DELTA_DEG  = 180.0    # generous backstop (joint limits are the real safety)
-JOINT_LIMIT_MARGIN = math.radians(2.0)  # 2° fixed margin from each joint limit
+JOINT_LIMIT_MARGIN = math.radians(3.0)  # 3° margin from each joint limit
 
 # IK joint-space smoothing: per-joint EMA rate (0=frozen, 1=instant)
 # J4 (forearm twist) tracks slower to prevent slamming into limits
@@ -110,6 +123,7 @@ T_BASE_ROT = np.diag([1.0, -1.0, -1.0])
 GREEN  = "\033[32m"
 RED    = "\033[31m"
 YELLOW = "\033[33m"
+CYAN   = "\033[36m"
 RESET  = "\033[0m"
 
 # ── cv2 overlay ──────────────────────────────────────────────────────────────
@@ -163,6 +177,22 @@ def normalize_delta_euler(roll, pitch, yaw):
         if abs(alt_roll) + abs(alt_pitch) + abs(alt_yaw) < abs(roll) + abs(pitch) + abs(yaw):
             return alt_roll, alt_pitch, alt_yaw
     return roll, pitch, yaw
+
+
+def compute_yaw_fix(R_home):
+    """Compute a Y-axis rotation matrix that undoes the tracking-space yaw.
+
+    SteamVR's tracking universe can be oriented arbitrarily (e.g. 180° rotated
+    when the Quest reconnects facing a different direction).  This extracts the
+    yaw component from the home rotation and returns a matrix that undoes it,
+    so position and rotation deltas are tracking-space invariant.
+
+    With "normal" tracking (yaw ≈ 0) this returns ~identity → no effect.
+    """
+    rx, rz = float(R_home[0, 0]), float(R_home[2, 0])
+    yaw = math.atan2(rz, rx)  # = -θ where θ is tracking space yaw
+    c, s = math.cos(yaw), math.sin(yaw)  # R_y(-θ) undoes the yaw
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
 
 
 def remap(pos_delta_m, axis_map):
@@ -341,6 +371,17 @@ def parse_args():
     p.add_argument("--invert-gripper", action="store_true")
     p.add_argument("--port",           default=8765, type=int)
     p.add_argument("--host",           default="0.0.0.0")
+    # Recording (on by default — use --no-record to disable)
+    p.add_argument("--record",         default="./data/my_task", metavar="DIR",
+                   help="Dataset directory (default: ./data/my_task)")
+    p.add_argument("--no-record",      action="store_true",
+                   help="Disable recording")
+    p.add_argument("--rec-fps",        default=20, type=int,
+                   help="Recording FPS (default: 20)")
+    p.add_argument("--cameras",        default="auto", metavar="IDS",
+                   help="Camera IDs (default: auto-detect)")
+    p.add_argument("--task",           default="teleoperation demo",
+                   help="Task description for dataset metadata")
     return p.parse_args()
 
 
@@ -525,6 +566,230 @@ def countdown_display(seconds, label):
     print()
 
 
+# ── Recording (LeRobot v2.1) ──────────────────────────────────────────────────
+
+def _extract_buttons(frame, hand):
+    """Return button dict from VR frame data."""
+    if frame is None:
+        return {}
+    c = frame.get(hand)
+    if c is None:
+        return {}
+    return c.get("buttons", {})
+
+
+class EpisodeBuffer:
+    """Accumulate timestep data for one recording episode."""
+
+    def __init__(self):
+        self.rows = []
+        self.video_frames = {}   # {cam_name: [bgr_frame, ...]}
+        self.t0 = None
+
+    def add(self, joints, eef_pos, eef_rot_flat, eef_euler, gripper,
+            prev_joints, prev_eef_pos, prev_eef_euler, prev_gripper,
+            camera_frames):
+        now = time.time()
+        if self.t0 is None:
+            self.t0 = now
+        ts = now - self.t0
+
+        abs_joint = list(joints) + [gripper]
+        if prev_joints is not None:
+            delta_joint = [joints[i] - prev_joints[i] for i in range(6)] + [gripper - prev_gripper]
+        else:
+            delta_joint = [0.0] * 7
+        abs_eef = list(eef_pos) + list(eef_euler) + [gripper]
+        if prev_eef_pos is not None:
+            delta_eef = ([eef_pos[i] - prev_eef_pos[i] for i in range(3)]
+                         + [eef_euler[i] - prev_eef_euler[i] for i in range(3)]
+                         + [gripper - prev_gripper])
+        else:
+            delta_eef = [0.0] * 7
+
+        self.rows.append({
+            "timestamp": ts,
+            "obs_state": abs_joint,
+            "obs_eef_pos": list(eef_pos),
+            "obs_eef_rot": list(eef_rot_flat),
+            "obs_eef_euler": list(eef_euler),
+            "action_abs_joint": abs_joint,
+            "action_delta_joint": delta_joint,
+            "action_abs_eef": abs_eef,
+            "action_delta_eef": delta_eef,
+        })
+        for name, fr in camera_frames.items():
+            if name not in self.video_frames:
+                self.video_frames[name] = []
+            self.video_frames[name].append(fr)
+
+    def __len__(self):
+        return len(self.rows)
+
+
+class DatasetWriter:
+    """Write episodes to a LeRobot v2.1 directory."""
+
+    def __init__(self, dataset_dir, fps, task, camera_names):
+        self.dir = os.path.abspath(dataset_dir)
+        self.fps = fps
+        self.task = task
+        self.cam_names = camera_names
+        self.ep_count = 0
+        self.total_frames = 0
+
+        os.makedirs(os.path.join(self.dir, "data", "chunk-000"), exist_ok=True)
+        os.makedirs(os.path.join(self.dir, "meta"), exist_ok=True)
+        for c in camera_names:
+            os.makedirs(os.path.join(self.dir, "videos", "chunk-000",
+                                     f"observation.images.{c}"), exist_ok=True)
+        info_path = os.path.join(self.dir, "meta", "info.json")
+        if os.path.exists(info_path):
+            with open(info_path) as f:
+                info = json.load(f)
+            self.ep_count = info.get("total_episodes", 0)
+            self.total_frames = info.get("total_frames", 0)
+
+    def save(self, buf):
+        if not _arrow_ok:
+            print(f"  {RED}pyarrow not installed — cannot save{RESET}")
+            return None
+        ep = self.ep_count
+        n = len(buf)
+        cols = {
+            "timestamp": [], "episode_index": [], "frame_index": [],
+            "index": [], "next.done": [], "task_index": [],
+            "observation.state": [], "observation.eef_pos": [],
+            "observation.eef_rot": [], "observation.eef_euler": [],
+            "action.abs_joint": [], "action.delta_joint": [],
+            "action.abs_eef": [], "action.delta_eef": [],
+        }
+        for i, row in enumerate(buf.rows):
+            cols["timestamp"].append(row["timestamp"])
+            cols["episode_index"].append(ep)
+            cols["frame_index"].append(i)
+            cols["index"].append(self.total_frames + i)
+            cols["next.done"].append(i == n - 1)
+            cols["task_index"].append(0)
+            cols["observation.state"].append(row["obs_state"])
+            cols["observation.eef_pos"].append(row["obs_eef_pos"])
+            cols["observation.eef_rot"].append(row["obs_eef_rot"])
+            cols["observation.eef_euler"].append(row["obs_eef_euler"])
+            cols["action.abs_joint"].append(row["action_abs_joint"])
+            cols["action.delta_joint"].append(row["action_delta_joint"])
+            cols["action.abs_eef"].append(row["action_abs_eef"])
+            cols["action.delta_eef"].append(row["action_delta_eef"])
+        for cam in self.cam_names:
+            vp = f"videos/chunk-000/observation.images.{cam}/episode_{ep:06d}.mp4"
+            cols[f"observation.images.{cam}"] = [
+                {"path": vp, "timestamp": row["timestamp"]} for row in buf.rows
+            ]
+
+        arrays = {}
+        for key, vals in cols.items():
+            if key.startswith("observation.images."):
+                arrays[key] = pa.StructArray.from_arrays(
+                    [pa.array([v["path"] for v in vals], type=pa.string()),
+                     pa.array([v["timestamp"] for v in vals], type=pa.float32())],
+                    names=["path", "timestamp"])
+            elif isinstance(vals[0], list):
+                arrays[key] = pa.array(vals, type=pa.list_(pa.float32()))
+            elif isinstance(vals[0], bool):
+                arrays[key] = pa.array(vals, type=pa.bool_())
+            elif isinstance(vals[0], int):
+                arrays[key] = pa.array(vals, type=pa.int64())
+            else:
+                arrays[key] = pa.array(vals, type=pa.float32())
+        pq.write_table(pa.table(arrays),
+                        os.path.join(self.dir, "data", "chunk-000",
+                                     f"episode_{ep:06d}.parquet"))
+
+        for cam in self.cam_names:
+            frames = buf.video_frames.get(cam, [])
+            if frames and _cv2_ok:
+                vpath = os.path.join(self.dir, "videos", "chunk-000",
+                                     f"observation.images.{cam}",
+                                     f"episode_{ep:06d}.mp4")
+                h, w = frames[0].shape[:2]
+                wr = cv2.VideoWriter(vpath, cv2.VideoWriter_fourcc(*'mp4v'),
+                                     self.fps, (w, h))
+                for fr in frames:
+                    wr.write(fr)
+                wr.release()
+
+        self.ep_count += 1
+        self.total_frames += n
+        self._write_meta(ep, n)
+        return ep
+
+    def _write_meta(self, ep_idx, ep_len):
+        meta = os.path.join(self.dir, "meta")
+        features = {}
+        for name, shape, nms in [
+            ("observation.state", [7], ["j1","j2","j3","j4","j5","j6","gripper"]),
+            ("observation.eef_pos", [3], ["x","y","z"]),
+            ("observation.eef_rot", [9], ["r00","r01","r02","r10","r11","r12","r20","r21","r22"]),
+            ("observation.eef_euler", [3], ["roll","pitch","yaw"]),
+            ("action.abs_joint", [7], ["j1","j2","j3","j4","j5","j6","gripper"]),
+            ("action.delta_joint", [7], ["dj1","dj2","dj3","dj4","dj5","dj6","dgripper"]),
+            ("action.abs_eef", [7], ["x","y","z","roll","pitch","yaw","gripper"]),
+            ("action.delta_eef", [7], ["dx","dy","dz","droll","dpitch","dyaw","dgripper"]),
+        ]:
+            features[name] = {"dtype": "float32", "shape": shape, "names": nms}
+        for c in self.cam_names:
+            features[f"observation.images.{c}"] = {
+                "dtype": "video", "shape": [480, 640, 3],
+                "names": ["height","width","channel"],
+                "info": {"video.fps": self.fps, "video.codec": "mp4v"},
+            }
+        for k, dt, sh in [("episode_index","int64",[1]),("frame_index","int64",[1]),
+                           ("timestamp","float32",[1]),("index","int64",[1]),
+                           ("next.done","bool",[1]),("task_index","int64",[1])]:
+            features[k] = {"dtype": dt, "shape": sh}
+        info = {
+            "codebase_version": "v2.1", "robot_type": "piper_hanging",
+            "fps": self.fps, "total_episodes": self.ep_count,
+            "total_frames": self.total_frames, "total_tasks": 1,
+            "total_videos": self.ep_count * len(self.cam_names),
+            "splits": {"train": f"0:{self.ep_count}"}, "features": features,
+        }
+        with open(os.path.join(meta, "info.json"), "w") as f:
+            json.dump(info, f, indent=2)
+        with open(os.path.join(meta, "tasks.jsonl"), "w") as f:
+            f.write(json.dumps({"task_index": 0, "task": self.task}) + "\n")
+        with open(os.path.join(meta, "episodes.jsonl"), "a") as f:
+            f.write(json.dumps({"episode_index": ep_idx, "tasks": [self.task],
+                                "length": ep_len}) + "\n")
+
+
+class CameraCapture:
+    """Manage USB cameras for recording."""
+
+    def __init__(self, cam_ids):
+        self.caps = {}
+        self.names = []
+        for cid in cam_ids:
+            cap = cv2.VideoCapture(cid)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                name = f"cam_{cid}"
+                self.caps[name] = cap
+                self.names.append(name)
+
+    def read_all(self):
+        out = {}
+        for name, cap in self.caps.items():
+            ret, frame = cap.read()
+            if ret:
+                out[name] = frame
+        return out
+
+    def release(self):
+        for cap in self.caps.values():
+            cap.release()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -639,11 +904,21 @@ def main():
                              hands=active_hands)
     vr_home_pos = {}
     vr_home_R   = {}
+    vr_yaw_fix  = {}
     for h in active_hands:
         vr_home_pos[h], vr_home_R[h] = refs[h]
+        vr_yaw_fix[h] = compute_yaw_fix(vr_home_R[h])
 
     _disp["phase"] = "streaming"
     print(f"  {GREEN}VR home captured.{RESET}")
+    for h in active_hands:
+        p = vr_home_pos[h]
+        R = vr_home_R[h]
+        rx, rz = float(R[0, 0]), float(R[2, 0])
+        yaw_deg = math.degrees(math.atan2(rz, rx))
+        print(f"  {h.upper()} VR ref pos: [{p[0]:+.4f}, {p[1]:+.4f}, {p[2]:+.4f}]")
+        print(f"  {h.upper()} tracking yaw: {yaw_deg:+.1f}°  "
+              f"({'normal' if abs(yaw_deg) < 45 else 'rotated — auto-correcting'})")
     print()
 
     # ── Connect robot arms & read actual home position ────────────────────────
@@ -721,6 +996,47 @@ def main():
         for h in active_hands:
             cmds[h] = ArmCommander(ctrls[h], h)
 
+    # ── Recording setup ────────────────────────────────────────────────────
+    rec_enabled = not args.no_record
+    rec_writer = None
+    rec_cameras = None
+    rec_hand = active_hands[-1]  # use right controller for buttons (or only one)
+
+    if rec_enabled:
+        if not _arrow_ok:
+            print(f"  {RED}ERROR: pyarrow required for recording. "
+                  f"pip install pyarrow{RESET}")
+            sys.exit(1)
+        # Auto-detect camera: try indices 0-4, use the first one that opens
+        if args.cameras == "auto":
+            cam_ids = []
+            if _cv2_ok:
+                for test_id in range(5):
+                    cap = cv2.VideoCapture(test_id)
+                    if cap.isOpened():
+                        cam_ids.append(test_id)
+                        cap.release()
+                        break  # only one camera
+                    cap.release()
+        else:
+            cam_ids = [int(x) for x in args.cameras.split(",") if x.strip()]
+        if _cv2_ok and cam_ids:
+            rec_cameras = CameraCapture(cam_ids)
+            print(f"  Cameras    : {rec_cameras.names}")
+        else:
+            rec_cameras = CameraCapture([])
+            if _cv2_ok:
+                print(f"  {YELLOW}No camera found — recording without video{RESET}")
+        rec_writer = DatasetWriter(args.record, args.rec_fps, args.task,
+                                   rec_cameras.names)
+        print(f"  Recording  : {args.record}")
+        print(f"  Rec FPS    : {args.rec_fps}")
+        print(f"  Task       : {args.task}")
+        print(f"  Episodes   : {rec_writer.ep_count} existing")
+        print(f"  Buttons    : {rec_hand.upper()} controller "
+              f"(X/A=start/discard  Y/B=stop/save)")
+        print()
+
     # ── Per-arm state ────────────────────────────────────────────────────────
     I3 = np.eye(3, dtype=np.float64)
     # Position: committed deltas from robot home (cm)
@@ -755,22 +1071,35 @@ def main():
     last_update = 0.0
     last_print  = 0.0
 
+    # Recording state machine
+    REC_IDLE, REC_RECORDING = "IDLE", "RECORDING"
+    rec_state = REC_IDLE
+    rec_buf = None
+    rec_prev_joints = None
+    rec_prev_eef_pos = None
+    rec_prev_eef_euler = None
+    rec_prev_gripper = 0.0
+    rec_last_sample = 0.0
+    rec_interval = 1.0 / args.rec_fps if rec_enabled else 1.0
+
     sim_note = f"  {YELLOW}[SIMULATION]{RESET}" if not with_robot else ""
     print(f"  Streaming 6DOF ({arm_label}) — Ctrl+C to stop{sim_note}")
+    if rec_enabled:
+        print(f"  {CYAN}Recording controls (press in terminal):{RESET}")
+        print(f"    {GREEN}R{RESET} = start recording    {YELLOW}S{RESET} = stop + save")
+        print(f"    {RED}D{RESET} = discard             ESC = quit")
     print()
 
-    # Print header
-    cols = []
-    for h in active_hands:
-        tag = h[0].upper()
-        cols.append(f"{tag+'_x':>7s} {tag+'_y':>7s} {tag+'_z':>7s}  "
-                    f"{tag+'_R':>6s} {tag+'_P':>6s} {tag+'_Y':>6s}")
-    grip_hdr = "  ".join(f"{h[0].upper()+'_gr':>5s}" for h in active_hands)
-    print(f"  {'time':>8s}  {'  '.join(cols)}  {grip_hdr}  {'age':>5s}")
-    print(f"  {'':->8s}  "
-          + "  ".join(f"{'':->7s} {'':->7s} {'':->7s}  {'':->6s} {'':->6s} {'':->6s}" for _ in active_hands)
-          + "  " + "  ".join(f"{'':->5s}" for _ in active_hands)
-          + f"  {'':->5s}")
+    # ── Terminal raw mode for single-keypress input ────────────────────────────
+    _old_term = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+
+    def _get_key():
+        """Non-blocking single keypress from terminal. Returns key code or -1."""
+        if select.select([sys.stdin], [], [], 0)[0]:
+            ch = sys.stdin.read(1)
+            return ord(ch)
+        return -1
 
     # ── Main control loop ─────────────────────────────────────────────────────
     try:
@@ -788,16 +1117,19 @@ def main():
                 tracking[hand] = ok
 
                 if ok:
-                    # Position delta
-                    raw_dp = remap((pos - vr_home_pos[hand]) * scale, AXIS_MAP)
+                    # Position delta (yaw-corrected for tracking-space invariance)
+                    dp_vr = (pos - vr_home_pos[hand]) * scale
+                    dp_fixed = vr_yaw_fix[hand] @ dp_vr
+                    raw_dp = remap(dp_fixed, AXIS_MAP)
                     smooth_pos[hand][0] = alpha * deadband(raw_dp[2] * 100, DEADBAND_CM) + (1 - alpha) * smooth_pos[hand][0]
                     smooth_pos[hand][1] = alpha * deadband(raw_dp[1] * 100, DEADBAND_CM) + (1 - alpha) * smooth_pos[hand][1]
                     smooth_pos[hand][2] = alpha * deadband(-raw_dp[0] * 100, DEADBAND_CM) + (1 - alpha) * smooth_pos[hand][2]
 
-                    # Rotation: VR delta → robot frame → smooth as MATRIX
-                    # (avoids all Euler singularity issues)
+                    # Rotation: yaw-corrected VR delta → robot frame → smooth
                     R_delta_vr  = rotation_delta(R, vr_home_R[hand])
-                    R_delta_rob = P @ R_delta_vr @ Pt
+                    Yf = vr_yaw_fix[hand]
+                    R_delta_fixed = Yf @ R_delta_vr @ Yf.T
+                    R_delta_rob = P @ R_delta_fixed @ Pt
                     if rot_scale != 1.0:
                         R_delta_rob = scale_rotation(R_delta_rob, rot_scale)
                     smooth_R[hand] = rotation_ema(R_delta_rob, smooth_R[hand], alpha)
@@ -807,6 +1139,34 @@ def main():
                     grip_raw[hand] = float(np.clip(t_val * 100.0, 0.0, 100.0))
 
             frame_num += 1
+
+            # ── Recording state machine (keyboard: R=record, S=save, D=discard) ──
+            if rec_enabled and rec_state == REC_RECORDING:
+                now_rec = time.time()
+                if now_rec - rec_last_sample >= rec_interval:
+                    rec_last_sample = now_rec
+                    try:
+                        rj = ctrls[rec_hand].read_joints() if rec_hand in ctrls else list(HOME_POSITION)
+                        T_ee, _ = forward_kinematics(rj)
+                        eef_p = T_ee[:3, 3].tolist()
+                        eef_R = T_ee[:3, :3]
+                        eef_rot_flat = eef_R.flatten().tolist()
+                        eef_eul = list(rotation_to_euler(eef_R))
+                        g_val = com_grip[rec_hand] / 100.0
+                        cam_frames = rec_cameras.read_all() if rec_cameras else {}
+                        rec_buf.add(
+                            rj, eef_p, eef_rot_flat, eef_eul, g_val,
+                            rec_prev_joints, rec_prev_eef_pos,
+                            rec_prev_eef_euler, rec_prev_gripper,
+                            cam_frames,
+                        )
+                        rec_prev_joints = list(rj)
+                        rec_prev_eef_pos = list(eef_p)
+                        rec_prev_eef_euler = list(eef_eul)
+                        rec_prev_gripper = g_val
+                    except Exception as e:
+                        if frame_num % 200 == 0:
+                            print(f"\n  [REC WARN] {e}")
 
             # ── Accept new targets (every UPDATE_INTERVAL) ──────────────────
             now = time.time()
@@ -872,7 +1232,6 @@ def main():
                 if with_robot and hand in cmds:
                     if ik_mode:
                         # Local IK: compute target in FK world frame directly
-                        # (avoids firmware FK ↔ our FK mismatch)
                         delta_m = np.array([clamped_pos[j] / 100.0 for j in range(3)])
                         pos_w = list(ik_home_pos_w + T_BASE_ROT @ delta_m)
                         R_delta_w = T_BASE_ROT @ com_R[hand] @ T_BASE_ROT
@@ -882,10 +1241,15 @@ def main():
                                          margin=JOINT_LIMIT_MARGIN,
                                          joint_weights=IK_JOINT_WEIGHTS)
                         if q_sol is not None:
-                            last_ik_q[hand] = list(q_sol)  # unsmoothed seed
+                            last_ik_q[hand] = list(q_sol)
                             for i in range(6):
                                 cmd_q[hand][i] += IK_JOINT_ALPHA[i] * (q_sol[i] - cmd_q[hand][i])
-                            cmds[hand].send_joints(cmd_q[hand])
+                        # Hard clamp: NEVER send joints past limit - 3°
+                        for i in range(6):
+                            lo = JOINT_LOWER[i] + JOINT_LIMIT_MARGIN
+                            hi = JOINT_UPPER[i] - JOINT_LIMIT_MARGIN
+                            cmd_q[hand][i] = max(lo, min(hi, cmd_q[hand][i]))
+                        cmds[hand].send_joints(cmd_q[hand])
                     else:
                         # Firmware IK: send Cartesian target
                         cmds[hand].send(
@@ -898,33 +1262,7 @@ def main():
             if now - last_print >= 1.0 / DISPLAY_HZ:
                 last_print = now
 
-                parts = []
-                for hand in active_hands:
-                    cp = [max(-max_pos_d, min(max_pos_d, com_pos[hand][j])) for j in range(3)]
-                    sp = [robot_home[hand]["pos"][j] + cp[j] / 100 for j in range(3)]
-                    # Extract Euler from committed rotation matrix for display
-                    drpy_raw = rotation_to_euler(com_R[hand])
-                    drpy_disp = normalize_delta_euler(*drpy_raw)
-                    d_rpy = [math.degrees(x) for x in drpy_disp]
-                    parts.append(
-                        f"{sp[0]*100:+7.2f} {sp[1]*100:+7.2f} {sp[2]*100:+7.2f}  "
-                        f"{d_rpy[0]:+6.1f} {d_rpy[1]:+6.1f} {d_rpy[2]:+6.1f}"
-                    )
-
-                grip_parts = [f"{com_grip[h]:5.1f}" for h in active_hands]
-
-                # Joint limit indicator
-                limit_str = ""
-                for hand in active_hands:
-                    if at_limit.get(hand, False):
-                        jstr = ",".join(f"J{j}{d}" for j, d in limit_info.get(hand, []))
-                        limit_str += f" {RED}LIMIT({hand[0].upper()}:{jstr}){RESET}"
-
-                print(f"  {now - t_wait0:7.1f}s  "
-                      f"{'  '.join(parts)}  "
-                      f"{'  '.join(grip_parts)}  "
-                      f"{age_ms:5.0f}ms{limit_str}")
-
+                # Build compact status for cv2 overlay (detailed data stays on screen only)
                 _disp["frame"] = frame_num
                 for hand in active_hands:
                     drpy_raw = rotation_to_euler(com_R[hand])
@@ -938,8 +1276,122 @@ def main():
 
                 if _cv2_ok:
                     cv2.imshow("Remote Teleop 6DOF", render_frame())
-                    if cv2.waitKey(1) == 27:
-                        break
+                    # Show live camera feed
+                    if rec_cameras and rec_cameras.caps:
+                        cam_frames = rec_cameras.read_all()
+                        for cname, cframe in cam_frames.items():
+                            label = "REC" if rec_state == REC_RECORDING else "LIVE"
+                            color = (0, 0, 255) if rec_state == REC_RECORDING else (0, 255, 0)
+                            cv2.putText(cframe, f"{label} {cname}",
+                                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.7, color, 2)
+                            cv2.imshow(cname, cframe)
+                    cv2.waitKey(1)
+
+            # ── Recording status on terminal ───────────────────────────────
+            if rec_enabled and rec_state == REC_RECORDING and rec_buf:
+                n = len(rec_buf)
+                dur = rec_buf.rows[-1]["timestamp"] if rec_buf.rows else 0
+                print(f"\r  {RED}● RECORDING{RESET}  "
+                      f"{n} frames / {dur:.1f}s  "
+                      f"(S=save  D=discard)        ",
+                      end="", flush=True)
+
+            # ── Keyboard input from terminal (R/S/D/ESC) ──────────────────
+            key = _get_key()
+            if key == 27:  # ESC
+                break
+            if rec_enabled:
+                if key == ord('r') and rec_state == REC_IDLE:
+                    rec_buf = EpisodeBuffer()
+                    rec_prev_joints = None
+                    rec_prev_eef_pos = None
+                    rec_prev_eef_euler = None
+                    rec_prev_gripper = 0.0
+                    rec_last_sample = 0.0
+                    rec_state = REC_RECORDING
+                    print(f"\n  {GREEN}● REC started "
+                          f"(ep {rec_writer.ep_count}){RESET}")
+                elif key == ord('s') and rec_state == REC_RECORDING:
+                    # Stop + save
+                    n = len(rec_buf) if rec_buf else 0
+                    dur = rec_buf.rows[-1]["timestamp"] if n > 0 else 0
+                    print(f"\n  {YELLOW}■ Saving... "
+                          f"({n} frames, {dur:.1f}s){RESET}")
+                    if with_robot and rec_hand in ctrls:
+                        try:
+                            ctrls[rec_hand].go_home()
+                        except Exception:
+                            pass
+                    ep = rec_writer.save(rec_buf)
+                    print(f"  {GREEN}✓ Saved episode {ep}{RESET}")
+                    rec_buf = None
+                    rec_state = REC_IDLE
+                    # 5-second countdown before recalibration
+                    for sec in range(5, 0, -1):
+                        print(f"\r  {YELLOW}Recalibrating in {sec}s — "
+                              f"hold controller at home ...{RESET}   ",
+                              end="", flush=True)
+                        time.sleep(1)
+                    print()
+                    try:
+                        refs = capture_reference(
+                            secs=1.5, poll_interval=1.0 / HOLD_HZ,
+                            hands=active_hands)
+                        for h in active_hands:
+                            vr_home_pos[h], vr_home_R[h] = refs[h]
+                            vr_yaw_fix[h] = compute_yaw_fix(vr_home_R[h])
+                            smooth_pos[h] = [0.0, 0.0, 0.0]
+                            smooth_R[h] = I3.copy()
+                            com_pos[h] = [0.0, 0.0, 0.0]
+                            com_R[h] = I3.copy()
+                            safe_pos[h] = [0.0, 0.0, 0.0]
+                            safe_R[h] = I3.copy()
+                            if ik_mode and h in ctrls:
+                                q0 = ctrls[h].read_joints()
+                                last_ik_q[h] = list(q0)
+                                cmd_q[h] = list(q0)
+                        print(f"  {GREEN}Recalibrated. Ready.{RESET}")
+                    except Exception as e:
+                        print(f"  {RED}Recalibration failed: {e}{RESET}")
+                elif key == ord('d') and rec_state == REC_RECORDING:
+                    # Discard + home + recalibrate
+                    n = len(rec_buf) if rec_buf else 0
+                    rec_buf = None
+                    rec_state = REC_IDLE
+                    print(f"\n  {RED}✗ Discarded ({n} frames){RESET}")
+                    if with_robot and rec_hand in ctrls:
+                        try:
+                            ctrls[rec_hand].go_home()
+                        except Exception:
+                            pass
+                    # 5-second countdown before recalibration
+                    for sec in range(5, 0, -1):
+                        print(f"\r  {YELLOW}Recalibrating in {sec}s — "
+                              f"hold controller at home ...{RESET}   ",
+                              end="", flush=True)
+                        time.sleep(1)
+                    print()
+                    try:
+                        refs = capture_reference(
+                            secs=1.5, poll_interval=1.0 / HOLD_HZ,
+                            hands=active_hands)
+                        for h in active_hands:
+                            vr_home_pos[h], vr_home_R[h] = refs[h]
+                            vr_yaw_fix[h] = compute_yaw_fix(vr_home_R[h])
+                            smooth_pos[h] = [0.0, 0.0, 0.0]
+                            smooth_R[h] = I3.copy()
+                            com_pos[h] = [0.0, 0.0, 0.0]
+                            com_R[h] = I3.copy()
+                            safe_pos[h] = [0.0, 0.0, 0.0]
+                            safe_R[h] = I3.copy()
+                            if ik_mode and h in ctrls:
+                                q0 = ctrls[h].read_joints()
+                                last_ik_q[h] = list(q0)
+                                cmd_q[h] = list(q0)
+                        print(f"  {GREEN}Recalibrated. Ready.{RESET}")
+                    except Exception as e:
+                        print(f"  {RED}Recalibration failed: {e}{RESET}")
 
             # ── Rate limit (~40 Hz) ─────────────────────────────────────────
             elapsed = time.time() - t_start
@@ -951,6 +1403,17 @@ def main():
         print("\n\n  Stopped.")
 
     finally:
+        # Restore terminal settings
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _old_term)
+
+        # Discard any in-progress recording on exit
+        if rec_enabled and rec_buf and len(rec_buf) > 0:
+            print(f"  {RED}Discarded in-progress recording "
+                  f"({len(rec_buf)} frames){RESET}")
+
+        if rec_cameras:
+            rec_cameras.release()
+
         for h in cmds:
             cmds[h].stop()
 

@@ -100,8 +100,9 @@ def poll_controller(vr_system, cid, poses):
     trigger = 0.0
     try:
         success, state = vr_system.getControllerState(cid)
-        if success and len(state.rAxis) > 1:
-            trigger = max(0.0, min(1.0, float(state.rAxis[1].x)))
+        if success:
+            if len(state.rAxis) > 1:
+                trigger = max(0.0, min(1.0, float(state.rAxis[1].x)))
     except Exception:
         pass
 
