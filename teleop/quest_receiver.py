@@ -48,7 +48,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from piper_core import (
+from run_piper.piper_core import (
     ik_solve,
     euler_to_rotation,
     rotation_to_euler,

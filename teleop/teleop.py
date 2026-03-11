@@ -5,9 +5,9 @@ Remote Teleop 6DOF — Piper Hanging Arms (single or dual)
 Full 6-DOF control: position (X, Y, Z) AND orientation (roll, pitch, yaw).
 
 Supports single-arm mode:
-    python3 remote_teleop_6dof.py --with_robot --left can0          # left arm only
-    python3 remote_teleop_6dof.py --with_robot --right can1         # right arm only
-    python3 remote_teleop_6dof.py --with_robot --left can0 --right can1  # both
+    python teleop.py --with_robot --left can0          # left arm only
+    python teleop.py --with_robot --right can1         # right arm only
+    python teleop.py --with_robot --left can0 --right can1  # both
 
 Coordinate frame mapping (OpenVR → Robot hanging upside-down):
     Robot X = −VR Z   (VR forward → robot forward)
@@ -70,6 +70,19 @@ try:
     _arrow_ok = True
 except ImportError:
     _arrow_ok = False
+
+import subprocess as _sp
+
+def _say(text, wait=False):
+    """Speak text aloud using spd-say. wait=True blocks until done."""
+    try:
+        args = ["spd-say", "-r", "10"]
+        if wait:
+            args.append("-w")
+        args.append(text)
+        _sp.Popen(args, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    except Exception:
+        pass
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -304,6 +317,13 @@ class ArmCommander:
         with self._lock:
             self._joint_target = [float(v) for v in q]
             self._target = None
+
+    def clear(self):
+        """Stop sending any commands (silence the background thread)."""
+        with self._lock:
+            self._target = None
+            self._joint_target = None
+            self._grip_mm = None
 
     def gripper(self, mm: float):
         with self._lock:
@@ -554,8 +574,11 @@ def render_frame():
 
 
 def countdown_display(seconds, label):
+    _say(f"{label} {seconds} seconds")
     for i in range(seconds, 0, -1):
         _disp["countdown"] = i
+        if i <= 3:
+            _say(str(i))
         t_end = time.time() + 1.0
         while time.time() < t_end:
             if _cv2_ok:
@@ -587,36 +610,20 @@ class EpisodeBuffer:
         self.t0 = None
 
     def add(self, joints, eef_pos, eef_rot_flat, eef_euler, gripper,
-            prev_joints, prev_eef_pos, prev_eef_euler, prev_gripper,
             camera_frames):
         now = time.time()
         if self.t0 is None:
             self.t0 = now
         ts = now - self.t0
 
-        abs_joint = list(joints) + [gripper]
-        if prev_joints is not None:
-            delta_joint = [joints[i] - prev_joints[i] for i in range(6)] + [gripper - prev_gripper]
-        else:
-            delta_joint = [0.0] * 7
-        abs_eef = list(eef_pos) + list(eef_euler) + [gripper]
-        if prev_eef_pos is not None:
-            delta_eef = ([eef_pos[i] - prev_eef_pos[i] for i in range(3)]
-                         + [eef_euler[i] - prev_eef_euler[i] for i in range(3)]
-                         + [gripper - prev_gripper])
-        else:
-            delta_eef = [0.0] * 7
-
+        # Store raw observations only — actions are computed at save time
+        # with +1 timestep shift (action[t] = observation[t+1])
         self.rows.append({
             "timestamp": ts,
-            "obs_state": abs_joint,
+            "obs_state": list(joints) + [gripper],
             "obs_eef_pos": list(eef_pos),
             "obs_eef_rot": list(eef_rot_flat),
             "obs_eef_euler": list(eef_euler),
-            "action_abs_joint": abs_joint,
-            "action_delta_joint": delta_joint,
-            "action_abs_eef": abs_eef,
-            "action_delta_eef": delta_eef,
         })
         for name, fr in camera_frames.items():
             if name not in self.video_frames:
@@ -671,14 +678,40 @@ class DatasetWriter:
             cols["index"].append(self.total_frames + i)
             cols["next.done"].append(i == n - 1)
             cols["task_index"].append(0)
+            # Observations: current frame
             cols["observation.state"].append(row["obs_state"])
             cols["observation.eef_pos"].append(row["obs_eef_pos"])
             cols["observation.eef_rot"].append(row["obs_eef_rot"])
             cols["observation.eef_euler"].append(row["obs_eef_euler"])
-            cols["action.abs_joint"].append(row["action_abs_joint"])
-            cols["action.delta_joint"].append(row["action_delta_joint"])
-            cols["action.abs_eef"].append(row["action_abs_eef"])
-            cols["action.delta_eef"].append(row["action_delta_eef"])
+            # Actions: shifted by +1 — action[t] = observation[t+1]
+            # This is the standard convention for imitation learning:
+            # "given state t, predict where to go next"
+            if i < n - 1:
+                nxt = buf.rows[i + 1]
+                cur_s = row["obs_state"]
+                nxt_s = nxt["obs_state"]
+                cols["action.abs_joint"].append(nxt_s)
+                cols["action.delta_joint"].append(
+                    [nxt_s[j] - cur_s[j] for j in range(7)])
+                nxt_eef = (list(nxt["obs_eef_pos"])
+                           + list(nxt["obs_eef_euler"]) + [nxt_s[6]])
+                cols["action.abs_eef"].append(nxt_eef)
+                cur_eef_p = row["obs_eef_pos"]
+                cur_eef_e = row["obs_eef_euler"]
+                nxt_eef_p = nxt["obs_eef_pos"]
+                nxt_eef_e = nxt["obs_eef_euler"]
+                cols["action.delta_eef"].append(
+                    [nxt_eef_p[j] - cur_eef_p[j] for j in range(3)]
+                    + [nxt_eef_e[j] - cur_eef_e[j] for j in range(3)]
+                    + [nxt_s[6] - cur_s[6]])
+            else:
+                # Last frame: hold position (zero delta)
+                cols["action.abs_joint"].append(row["obs_state"])
+                cols["action.delta_joint"].append([0.0] * 7)
+                cols["action.abs_eef"].append(
+                    list(row["obs_eef_pos"]) + list(row["obs_eef_euler"])
+                    + [row["obs_state"][6]])
+                cols["action.delta_eef"].append([0.0] * 7)
         for cam in self.cam_names:
             vp = f"videos/chunk-000/observation.images.{cam}/episode_{ep:06d}.mp4"
             cols[f"observation.images.{cam}"] = [
@@ -893,10 +926,12 @@ def main():
         time.sleep(0.1)
 
     print("OK!")
+    _say("Controller connected")
     print()
 
     # ── Capture VR home reference pose (only active hands) ───────────────────
     _disp["phase"] = "calibrating"
+    _say("Hold controller at robot home position")
     print(f"  {YELLOW}Hold controller(s) at robot home position.{RESET}")
     countdown_display(int(args.ref_secs) + 3, "Snapping home in")
 
@@ -910,6 +945,7 @@ def main():
         vr_yaw_fix[h] = compute_yaw_fix(vr_home_R[h])
 
     _disp["phase"] = "streaming"
+    _say("Calibration complete")
     print(f"  {GREEN}VR home captured.{RESET}")
     for h in active_hands:
         p = vr_home_pos[h]
@@ -1075,10 +1111,6 @@ def main():
     REC_IDLE, REC_RECORDING = "IDLE", "RECORDING"
     rec_state = REC_IDLE
     rec_buf = None
-    rec_prev_joints = None
-    rec_prev_eef_pos = None
-    rec_prev_eef_euler = None
-    rec_prev_gripper = 0.0
     rec_last_sample = 0.0
     rec_interval = 1.0 / args.rec_fps if rec_enabled else 1.0
 
@@ -1156,14 +1188,8 @@ def main():
                         cam_frames = rec_cameras.read_all() if rec_cameras else {}
                         rec_buf.add(
                             rj, eef_p, eef_rot_flat, eef_eul, g_val,
-                            rec_prev_joints, rec_prev_eef_pos,
-                            rec_prev_eef_euler, rec_prev_gripper,
                             cam_frames,
                         )
-                        rec_prev_joints = list(rj)
-                        rec_prev_eef_pos = list(eef_p)
-                        rec_prev_eef_euler = list(eef_eul)
-                        rec_prev_gripper = g_val
                     except Exception as e:
                         if frame_num % 200 == 0:
                             print(f"\n  [REC WARN] {e}")
@@ -1303,37 +1329,88 @@ def main():
                 break
             if rec_enabled:
                 if key == ord('r') and rec_state == REC_IDLE:
+                    # Home robot first — sync ArmCommander before go_home
+                    # so the background thread doesn't fight the homing
+                    if with_robot and rec_hand in ctrls:
+                        _say("Homing robot")
+                        print(f"\n  {YELLOW}Homing robot before recording...{RESET}")
+                        cmds[rec_hand].clear()
+                        try:
+                            ctrls[rec_hand].go_home()
+                        except Exception:
+                            pass
+                        if ik_mode:
+                            cmd_q[rec_hand] = list(HOME_POSITION)
+                            last_ik_q[rec_hand] = list(HOME_POSITION)
+                    # 5-second countdown + recalibrate before recording
+                    _say("Prepare for calibration in 5 seconds")
+                    for sec in range(5, 0, -1):
+                        print(f"\r  {YELLOW}Calibrating in {sec}s — "
+                              f"hold controller at home ...{RESET}   ",
+                              end="", flush=True)
+                        if sec <= 3:
+                            _say(str(sec))
+                        time.sleep(1)
+                    print()
+                    _say("Calibrating")
+                    try:
+                        refs = capture_reference(
+                            secs=1.5, poll_interval=1.0 / HOLD_HZ,
+                            hands=active_hands)
+                        for h in active_hands:
+                            vr_home_pos[h], vr_home_R[h] = refs[h]
+                            vr_yaw_fix[h] = compute_yaw_fix(vr_home_R[h])
+                            smooth_pos[h] = [0.0, 0.0, 0.0]
+                            smooth_R[h] = I3.copy()
+                            com_pos[h] = [0.0, 0.0, 0.0]
+                            com_R[h] = I3.copy()
+                            safe_pos[h] = [0.0, 0.0, 0.0]
+                            safe_R[h] = I3.copy()
+                            if ik_mode and h in ctrls:
+                                q0 = ctrls[h].read_joints()
+                                last_ik_q[h] = list(q0)
+                                cmd_q[h] = list(q0)
+                        print(f"  {GREEN}Recalibrated.{RESET}")
+                    except Exception as e:
+                        print(f"  {RED}Recalibration failed: {e}{RESET}")
                     rec_buf = EpisodeBuffer()
-                    rec_prev_joints = None
-                    rec_prev_eef_pos = None
-                    rec_prev_eef_euler = None
-                    rec_prev_gripper = 0.0
                     rec_last_sample = 0.0
                     rec_state = REC_RECORDING
-                    print(f"\n  {GREEN}● REC started "
+                    _say("Recording started")
+                    print(f"  {GREEN}● REC started "
                           f"(ep {rec_writer.ep_count}){RESET}")
                 elif key == ord('s') and rec_state == REC_RECORDING:
                     # Stop + save
+                    _say("Recording stopped")
                     n = len(rec_buf) if rec_buf else 0
                     dur = rec_buf.rows[-1]["timestamp"] if n > 0 else 0
                     print(f"\n  {YELLOW}■ Saving... "
                           f"({n} frames, {dur:.1f}s){RESET}")
                     if with_robot and rec_hand in ctrls:
+                        cmds[rec_hand].clear()
                         try:
                             ctrls[rec_hand].go_home()
                         except Exception:
                             pass
+                        if ik_mode:
+                            cmd_q[rec_hand] = list(HOME_POSITION)
+                            last_ik_q[rec_hand] = list(HOME_POSITION)
                     ep = rec_writer.save(rec_buf)
+                    _say(f"Recording saved. Episode {ep}")
                     print(f"  {GREEN}✓ Saved episode {ep}{RESET}")
                     rec_buf = None
                     rec_state = REC_IDLE
-                    # 5-second countdown before recalibration
-                    for sec in range(5, 0, -1):
+                    # 15-second countdown before recalibration
+                    _say("Recalibration starting in 15 seconds")
+                    for sec in range(15, 0, -1):
                         print(f"\r  {YELLOW}Recalibrating in {sec}s — "
                               f"hold controller at home ...{RESET}   ",
                               end="", flush=True)
+                        if sec <= 5:
+                            _say(str(sec))
                         time.sleep(1)
                     print()
+                    _say("Calibrating")
                     try:
                         refs = capture_reference(
                             secs=1.5, poll_interval=1.0 / HOLD_HZ,
@@ -1351,27 +1428,37 @@ def main():
                                 q0 = ctrls[h].read_joints()
                                 last_ik_q[h] = list(q0)
                                 cmd_q[h] = list(q0)
+                        _say("Recalibrated. Ready")
                         print(f"  {GREEN}Recalibrated. Ready.{RESET}")
                     except Exception as e:
                         print(f"  {RED}Recalibration failed: {e}{RESET}")
                 elif key == ord('d') and rec_state == REC_RECORDING:
                     # Discard + home + recalibrate
+                    _say("Recording discarded")
                     n = len(rec_buf) if rec_buf else 0
                     rec_buf = None
                     rec_state = REC_IDLE
                     print(f"\n  {RED}✗ Discarded ({n} frames){RESET}")
                     if with_robot and rec_hand in ctrls:
+                        cmds[rec_hand].clear()
                         try:
                             ctrls[rec_hand].go_home()
                         except Exception:
                             pass
-                    # 5-second countdown before recalibration
-                    for sec in range(5, 0, -1):
+                        if ik_mode:
+                            cmd_q[rec_hand] = list(HOME_POSITION)
+                            last_ik_q[rec_hand] = list(HOME_POSITION)
+                    # 15-second countdown before recalibration
+                    _say("Recalibration starting in 15 seconds")
+                    for sec in range(15, 0, -1):
                         print(f"\r  {YELLOW}Recalibrating in {sec}s — "
                               f"hold controller at home ...{RESET}   ",
                               end="", flush=True)
+                        if sec <= 5:
+                            _say(str(sec))
                         time.sleep(1)
                     print()
+                    _say("Calibrating")
                     try:
                         refs = capture_reference(
                             secs=1.5, poll_interval=1.0 / HOLD_HZ,
@@ -1389,6 +1476,7 @@ def main():
                                 q0 = ctrls[h].read_joints()
                                 last_ik_q[h] = list(q0)
                                 cmd_q[h] = list(q0)
+                        _say("Recalibrated. Ready")
                         print(f"  {GREEN}Recalibrated. Ready.{RESET}")
                     except Exception as e:
                         print(f"  {RED}Recalibration failed: {e}{RESET}")

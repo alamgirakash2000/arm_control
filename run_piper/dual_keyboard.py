@@ -19,7 +19,7 @@ import math
 import tty
 import termios
 import threading
-from piper_core import (
+from run_piper.piper_core import (
     PiperHangingController,
     HOME_POSITION, RELAX_POSITION, SAFE_POSITION,
     JOINT_LOWER, JOINT_UPPER,

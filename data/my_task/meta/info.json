@@ -2,12 +2,12 @@
   "codebase_version": "v2.1",
   "robot_type": "piper_hanging",
   "fps": 20,
-  "total_episodes": 4,
-  "total_frames": 2382,
+  "total_episodes": 1,
+  "total_frames": 1013,
   "total_tasks": 1,
-  "total_videos": 4,
+  "total_videos": 1,
   "splits": {
-    "train": "0:4"
+    "train": "0:1"
   },
   "features": {
     "observation.state": {

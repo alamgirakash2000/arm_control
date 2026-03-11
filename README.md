@@ -14,42 +14,11 @@ sudo apt install can-utils
 sudo bash setup.sh 
 ```
 
-
-## Run
+## For recording demos:
+```bash 
+python teleop/teleop.py --with_robot --left can0 --record ./data/tool_good --task "tool inspection good"
+```
 
 ```bash
-python3 single_arm.py
-```
-
-The robot will home (all joints to zero), then you get an interactive prompt.
-
-
-## Running Dual Arms
-
-```bash
-python3 dual_arm.py
-```
-
-
-
-## Keyboard Controller
-
-```bash
-python single_keyboard.py
-```
-```
-
-==================================================
-  KEYBOARD CONTROL — HANGING  (1cm per press)
-==================================================
-  w/s    +X / -X  (forward / backward)
-  a/d    +Y / -Y  (left / right)
-  q/e    +Z / -Z  (up / down)
-  r      home     (safe -> mid-range)
-  t      relax    (safe -> elbow -> hang)
-  o/c    gripper open / close
-  [/]    speed down / up
-  x      quit
-==================================================
-
+python teleop/teleop.py --with_robot --left can0 --record ./data/tool_bad --task "tool inspection bad"
 ```

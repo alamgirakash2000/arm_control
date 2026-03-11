@@ -332,7 +332,13 @@ def main():
     print(f"  Press Ctrl+C to stop\n")
 
     interval = (1.0 / reader.fps) * args.slow
-    current_q = list(HOME_POSITION) + [0.0]  # for delta mode accumulation
+
+    # For delta mode: start from the first frame's actual joint state, not HOME
+    if args.action == "delta_joint" and states:
+        first_state = [float(v) for v in states[0]]
+        current_q = first_state[:6] + [first_state[6] if len(first_state) > 6 else 0.0]
+    else:
+        current_q = list(HOME_POSITION) + [0.0]
 
     try:
         for i in range(n_frames):
