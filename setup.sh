@@ -1,32 +1,25 @@
 #!/bin/bash
 # ==============================================================
-# Piper Dual Arm CAN Setup
+# Piper Arm CAN Setup
 # ==============================================================
-# Sets up CAN interfaces and identifies LEFT/RIGHT arms.
-#
-# First run:  flashes gripper on one arm, asks you to identify.
-# After that: auto-detects based on saved USB adapter serial.
+# Resets all CAN interfaces, brings them up fresh, and asks
+# you to verify which arm is LEFT/RIGHT.
 #
 # Usage:
-#   sudo bash piper_setup.sh
-#   sudo bash piper_setup.sh --reset   # Re-identify arms
+#   sudo bash setup.sh
 # ==============================================================
 
 CONFIG="$HOME/.piper_arms.conf"
 ENV_FILE="/tmp/piper_arms.env"
 BITRATE=1000000
 
-# Reset config if requested
-if [ "$1" = "--reset" ]; then
-    rm -f "$CONFIG"
-    echo "  Config cleared. Will re-identify arms."
-    echo ""
-fi
-
 echo "========================================"
-echo "  PIPER DUAL ARM CAN SETUP"
+echo "  PIPER ARM CAN SETUP"
 echo "========================================"
 echo ""
+
+# --- Clear old config ---
+rm -f "$CONFIG" "$ENV_FILE"
 
 # --- Find CAN interfaces ---
 INTERFACES=$(ls /sys/class/net/ 2>/dev/null | grep "^can" | sort)
@@ -40,18 +33,26 @@ COUNT=$(echo "$INTERFACES" | wc -w)
 echo "  Found $COUNT CAN interface(s): $INTERFACES"
 echo ""
 
-# --- Get USB identifier for each interface ---
-declare -A IFACE_ID
+# --- Reset and bring up all CAN interfaces ---
+echo "  Resetting all CAN interfaces..."
+for iface in $INTERFACES; do
+    ip link set $iface down 2>/dev/null || true
+done
+sleep 1
 
 for iface in $INTERFACES; do
-    # Try serial number first (most reliable across PCs)
+    ip link set $iface type can bitrate $BITRATE
+    ip link set $iface up
+    echo "  $iface: UP (bitrate $BITRATE)"
+done
+echo ""
+
+# --- Get USB identifier for each interface ---
+declare -A IFACE_ID
+for iface in $INTERFACES; do
     id=$(udevadm info -q property /sys/class/net/$iface 2>/dev/null | grep "^ID_SERIAL_SHORT=" | cut -d= -f2)
     if [ -z "$id" ]; then
         id=$(udevadm info -q property /sys/class/net/$iface 2>/dev/null | grep "^ID_SERIAL=" | cut -d= -f2)
-    fi
-    if [ -z "$id" ]; then
-        # No serial — fall back to USB path (works on same PC only)
-        id=$(udevadm info -q property /sys/class/net/$iface 2>/dev/null | grep "^ID_PATH=" | cut -d= -f2)
     fi
     if [ -z "$id" ]; then
         id="no_id_${iface}"
@@ -61,71 +62,48 @@ for iface in $INTERFACES; do
 done
 echo ""
 
-# --- Set up all CAN interfaces ---
-for iface in $INTERFACES; do
-    ip link set $iface down 2>/dev/null || true
-    ip link set $iface type can bitrate $BITRATE
-    ip link set $iface up
-    echo "  $iface: UP (bitrate $BITRATE)"
-done
-echo ""
+# --- Single arm ---
+if [ "$COUNT" -lt 2 ]; then
+    SINGLE=$(echo $INTERFACES | awk '{print $1}')
+    echo "  Only 1 CAN interface. Which arm is this?"
+    echo "    l = LEFT arm"
+    echo "    r = RIGHT arm"
+    read -p "  > " SIDE
 
-# --- Try to match from config ---
-LEFT_CAN=""
-RIGHT_CAN=""
-
-if [ -f "$CONFIG" ]; then
-    SAVED_LEFT=$(grep "^LEFT_ID=" "$CONFIG" | cut -d= -f2)
-    SAVED_RIGHT=$(grep "^RIGHT_ID=" "$CONFIG" | cut -d= -f2)
-
-    for iface in $INTERFACES; do
-        if [ "${IFACE_ID[$iface]}" = "$SAVED_LEFT" ]; then
-            LEFT_CAN=$iface
-        fi
-        if [ "${IFACE_ID[$iface]}" = "$SAVED_RIGHT" ]; then
-            RIGHT_CAN=$iface
-        fi
-    done
-
-    if [ -n "$LEFT_CAN" ] && [ -n "$RIGHT_CAN" ]; then
-        echo "  Auto-detected from saved config:"
-        echo "    LEFT  = $LEFT_CAN (${IFACE_ID[$LEFT_CAN]})"
-        echo "    RIGHT = $RIGHT_CAN (${IFACE_ID[$RIGHT_CAN]})"
-    else
-        echo "  Saved config doesn't match current adapters. Re-identifying..."
-        rm -f "$CONFIG"
-        LEFT_CAN=""
+    if [ "$SIDE" = "l" ] || [ "$SIDE" = "L" ]; then
+        LEFT_CAN=$SINGLE
         RIGHT_CAN=""
+    else
+        LEFT_CAN=""
+        RIGHT_CAN=$SINGLE
     fi
+
+    LEFT_ID=""
+    RIGHT_ID=""
+    [ -n "$LEFT_CAN" ] && LEFT_ID="${IFACE_ID[$LEFT_CAN]}"
+    [ -n "$RIGHT_CAN" ] && RIGHT_ID="${IFACE_ID[$RIGHT_CAN]}"
+    echo "LEFT_ID=$LEFT_ID" > "$CONFIG"
+    echo "RIGHT_ID=$RIGHT_ID" >> "$CONFIG"
+    echo "LEFT=${LEFT_CAN:-}" > "$ENV_FILE"
+    echo "RIGHT=${RIGHT_CAN:-}" >> "$ENV_FILE"
+
+    echo ""
+    echo "========================================"
+    [ -n "$LEFT_CAN" ]  && echo "  LEFT arm:  $LEFT_CAN"
+    [ -n "$RIGHT_CAN" ] && echo "  RIGHT arm: $RIGHT_CAN"
+    echo "========================================"
+    exit 0
 fi
 
-# --- First-time identification ---
-if [ -z "$LEFT_CAN" ] || [ -z "$RIGHT_CAN" ]; then
-    if [ "$COUNT" -lt 2 ]; then
-        echo "  Only $COUNT CAN interface found. Need 2 for dual arm."
-        echo "  Using $INTERFACES as LEFT arm only."
-        LEFT_CAN=$(echo $INTERFACES | head -1)
-        echo "LEFT_ID=${IFACE_ID[$LEFT_CAN]}" > "$CONFIG"
-        echo "RIGHT_ID=" >> "$CONFIG"
-        echo "LEFT=$LEFT_CAN" > "$ENV_FILE"
-        echo "RIGHT=" >> "$ENV_FILE"
-        echo ""
-        echo "  LEFT arm: $LEFT_CAN"
-        echo "  RIGHT arm: not connected"
-        exit 0
-    fi
+# --- Dual arm: flash gripper to identify ---
+IFACE1=$(echo $INTERFACES | awk '{print $1}')
+IFACE2=$(echo $INTERFACES | awk '{print $2}')
 
-    IFACE1=$(echo $INTERFACES | awk '{print $1}')
-    IFACE2=$(echo $INTERFACES | awk '{print $2}')
+echo "  Identifying arms — watch which gripper moves..."
+echo "  Flashing gripper on $IFACE1 in 3 seconds..."
+sleep 3
 
-    echo ""
-    echo "  FIRST-TIME SETUP: Identifying arms..."
-    echo "  I'll flash the gripper on one arm. Watch which one moves."
-    echo ""
-    echo "  Flashing gripper on $IFACE1 in 3 seconds..."
-    sleep 3
-
-    python3 -c "
+python3 -c "
 from piper_sdk import C_PiperInterface_V2
 import time, sys
 try:
@@ -147,28 +125,23 @@ except Exception as e:
     print(f'  Gripper flash failed: {e}', file=sys.stderr)
 " 2>&1
 
-    echo ""
-    echo "  Which arm's gripper just moved?"
-    echo "    l = that was the LEFT arm"
-    echo "    r = that was the RIGHT arm"
-    read -p "  > " SIDE
+echo ""
+echo "  Which arm's gripper just moved?"
+echo "    l = that was the LEFT arm"
+echo "    r = that was the RIGHT arm"
+read -p "  > " SIDE
 
-    if [ "$SIDE" = "l" ] || [ "$SIDE" = "L" ]; then
-        LEFT_CAN=$IFACE1
-        RIGHT_CAN=$IFACE2
-    else
-        LEFT_CAN=$IFACE2
-        RIGHT_CAN=$IFACE1
-    fi
-
-    # Save config
-    echo "LEFT_ID=${IFACE_ID[$LEFT_CAN]}" > "$CONFIG"
-    echo "RIGHT_ID=${IFACE_ID[$RIGHT_CAN]}" >> "$CONFIG"
-    echo ""
-    echo "  Config saved to $CONFIG"
+if [ "$SIDE" = "l" ] || [ "$SIDE" = "L" ]; then
+    LEFT_CAN=$IFACE1
+    RIGHT_CAN=$IFACE2
+else
+    LEFT_CAN=$IFACE2
+    RIGHT_CAN=$IFACE1
 fi
 
-# --- Write env file for Python ---
+# Save config
+echo "LEFT_ID=${IFACE_ID[$LEFT_CAN]}" > "$CONFIG"
+echo "RIGHT_ID=${IFACE_ID[$RIGHT_CAN]}" >> "$CONFIG"
 echo "LEFT=$LEFT_CAN" > "$ENV_FILE"
 echo "RIGHT=$RIGHT_CAN" >> "$ENV_FILE"
 
@@ -178,4 +151,4 @@ echo "  LEFT arm:  $LEFT_CAN"
 echo "  RIGHT arm: $RIGHT_CAN"
 echo "========================================"
 echo ""
-echo "  Run: python3 piper_hanging_dual.py"
+echo "  Config saved. Ready to go."

@@ -13,7 +13,7 @@ Usage:
     python3 demo_player.py --can can0 --dataset ./data/my_task --episode 0
 
     # Replay using delta joint actions instead of absolute
-    python3 demo_player.py --can can0 --dataset ./data/my_task --episode 0 --action delta_joint
+    python3 demo_player.py --can can0 --dataset ./data/tool_good --episode 0 --action delta_joint
 
     # Replay with live camera + recorded camera comparison
     python3 demo_player.py --can can0 --dataset ./data/my_task --episode 0 --cameras 0
@@ -45,6 +45,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from piper_core import (
     PiperHangingController,
     HOME_POSITION,
+    JOINT_LOWER,
+    JOINT_UPPER,
     RAD_TO_MDEG,
     forward_kinematics,
     rotation_to_euler,
@@ -193,7 +195,9 @@ class ReplayController:
                     q_interp = nq
                     g_interp = ng
                 try:
-                    jcmds = [round(q * RAD_TO_MDEG) for q in q_interp]
+                    margin = math.radians(2.0)
+                    q_clamped = [max(JOINT_LOWER[j] + margin, min(JOINT_UPPER[j] - margin, q_interp[j])) for j in range(6)]
+                    jcmds = [round(q * RAD_TO_MDEG) for q in q_clamped]
                     self._piper.MotionCtrl_2(0x01, 0x01, self._speed, 0x00)
                     self._piper.JointCtrl(*jcmds)
                     self._piper.GripperCtrl(round(g_interp * 35000), 1000, 0x01, 0)

@@ -14,7 +14,9 @@ import sys
 import math
 import tty
 import termios
-from piper_hanging import (
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "teleop"))
+from piper_core import (
     PiperHangingController, HOME_POSITION, RELAX_POSITION, SAFE_POSITION,
     JOINT_LOWER,
 )
