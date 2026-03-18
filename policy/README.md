@@ -16,7 +16,10 @@ Train and deploy diffusion policies for the Piper robot arm sub-tasks (pick, ins
 ## Training
 
 ```bash
-# Train pick policy (~5 hours on RTX 4090)
+# Recommended: watchdog supervisor with auto-resume on crashes/stalls
+bash policy/train_loop.sh ./data/pick ./checkpoints/pick 500 20
+
+# Direct trainer entry point
 python policy/train.py --dataset_dir ./data/pick --output_dir ./checkpoints/pick
 
 # Train inspect policy
@@ -37,12 +40,25 @@ python policy/train.py --dataset_dir ./data/place_good --output_dir ./checkpoint
 --resume path/to.pt   # resume from specific checkpoint
 ```
 
+`train_loop.sh` accepts extra trainer args after the first 4 positional args:
+
+```bash
+bash policy/train_loop.sh ./data/pick ./checkpoints/pick 500 20 --batch_size 16
+```
+
+Useful watchdog env vars:
+
+```bash
+STALL_TIMEOUT_SEC=1200 bash policy/train_loop.sh ./data/pick ./checkpoints/pick 500 20
+```
+
 ### Checkpoints
 
 Saved in `--output_dir`:
 - `best.pt` — lowest training loss
 - `latest.pt` — most recent epoch (for resuming)
 - `epoch_0050.pt`, `epoch_0100.pt`, ... — every 50 epochs
+- `training_status.json` — heartbeat/progress file used by the watchdog
 
 ## Testing on Robot
 

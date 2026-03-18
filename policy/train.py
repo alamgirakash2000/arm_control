@@ -38,20 +38,43 @@ def parse_args():
     p.add_argument("--action_horizon", type=int, default=None)
     p.add_argument("--resume", type=str, default=None,
                    help="Checkpoint to resume from (path or 'latest')")
+    p.add_argument("--epochs_per_run", type=int, default=20,
+                   help="Max epochs per process (restarts to avoid GPU hangs)")
+    p.add_argument("--num_workers", type=int, default=None)
+    p.add_argument("--pin_memory", action="store_true")
+    p.add_argument("--save_every_epochs", type=int, default=None)
+    p.add_argument("--save_latest_every_epochs", type=int, default=50,
+                   help="How often to rewrite latest.pt (full resume state)")
+    p.add_argument("--save_recovery_every_steps", type=int, default=200,
+                   help="How often to save recovery.pt (weights-only crash resume)")
+    p.add_argument("--sync_cuda_every_steps", type=int, default=0,
+                   help="Optional CUDA sync cadence for debugging; 0 disables it")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
+def atomic_torch_save(payload, path):
+    tmp_path = f"{path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def atomic_json_save(payload, path):
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp_path, path)
+
+
 def save_checkpoint(path, noise_net, vision_encoder, ema_model,
                     optimizer, lr_scheduler, state_norm, action_norm,
-                    config, global_step, epoch, best_loss):
-    torch.save({
+                    config, global_step, epoch, best_loss,
+                    include_optimizer_state=True,
+                    include_ema_state=True):
+    payload = {
         "noise_net": noise_net.state_dict(),
         "vision_encoder": vision_encoder.state_dict(),
-        "ema_noise_net": ema_model.averaged_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "lr_scheduler": lr_scheduler.state_dict(),
         "state_normalizer": state_norm.state_dict(),
         "action_normalizer": action_norm.state_dict(),
         "config": {
@@ -74,12 +97,43 @@ def save_checkpoint(path, noise_net, vision_encoder, ema_model,
         "epoch": epoch,
         "best_loss": best_loss,
         "ema_step": ema_model.optimization_step,
-    }, path)
+    }
+    if include_ema_state:
+        payload["ema_noise_net"] = ema_model.averaged_model.state_dict()
+    if include_optimizer_state:
+        payload["optimizer"] = optimizer.state_dict()
+        payload["lr_scheduler"] = lr_scheduler.state_dict()
+    atomic_torch_save(payload, path)
 
 
 def load_checkpoint(path, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     return ckpt
+
+
+def save_best_metadata(output_dir, best_loss, epoch, global_step):
+    atomic_json_save({
+        "best_loss": best_loss,
+        "epoch": epoch,
+        "global_step": global_step,
+    }, os.path.join(output_dir, "best_meta.json"))
+
+
+def load_best_metadata(output_dir):
+    path = os.path.join(output_dir, "best_meta.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_training_status(output_dir, status, **kwargs):
+    payload = {
+        "status": status,
+        "timestamp": time.time(),
+    }
+    payload.update(kwargs)
+    atomic_json_save(payload, os.path.join(output_dir, "training_status.json"))
 
 
 def format_eta(seconds):
@@ -110,20 +164,39 @@ def main():
         cfg.pred_horizon = args.pred_horizon
     if args.action_horizon is not None:
         cfg.action_horizon = args.action_horizon
+    if args.num_workers is not None:
+        cfg.num_workers = args.num_workers
+    if args.save_every_epochs is not None:
+        cfg.save_every_epochs = args.save_every_epochs
     cfg.use_wandb = args.wandb
 
     # Seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if args.save_latest_every_epochs < 1:
+        raise ValueError("--save_latest_every_epochs must be >= 1")
+    if args.save_recovery_every_steps < 1:
+        raise ValueError("--save_recovery_every_steps must be >= 1")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        # Prefer stability over maximum throughput on desktop GPUs.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
     os.makedirs(cfg.output_dir, exist_ok=True)
+    save_training_status(
+        cfg.output_dir,
+        "initializing",
+        dataset_dir=cfg.dataset_dir,
+        device=str(device),
+        pid=os.getpid(),
+    )
 
     # Dataset
     print(f"\n=== Loading dataset from {cfg.dataset_dir} ===")
@@ -133,11 +206,17 @@ def main():
         pred_horizon=cfg.pred_horizon,
         image_size=cfg.image_size,
     )
-    dataloader = DataLoader(
-        dataset, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=0, pin_memory=False,
-        drop_last=True,
-    )
+    dataloader_kwargs = {
+        "batch_size": cfg.batch_size,
+        "shuffle": True,
+        "num_workers": cfg.num_workers,
+        "pin_memory": args.pin_memory,
+        "drop_last": True,
+    }
+    if cfg.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = 2
+    dataloader = DataLoader(dataset, **dataloader_kwargs)
 
     # Normalization
     print("Computing normalization statistics...")
@@ -204,20 +283,32 @@ def main():
         ckpt_path = args.resume
         if ckpt_path == "latest":
             ckpt_path = os.path.join(cfg.output_dir, "latest.pt")
+            if not os.path.exists(ckpt_path):
+                recovery_path = os.path.join(cfg.output_dir, "recovery.pt")
+                if os.path.exists(recovery_path):
+                    ckpt_path = recovery_path
         if os.path.exists(ckpt_path):
             print(f"\nResuming from {ckpt_path}")
             ckpt = load_checkpoint(ckpt_path, device)
             noise_net.load_state_dict(ckpt["noise_net"])
             vision_encoder.load_state_dict(ckpt["vision_encoder"])
-            ema_model.averaged_model.load_state_dict(ckpt["ema_noise_net"])
-            ema_model.optimization_step = ckpt["ema_step"]
-            optimizer.load_state_dict(ckpt["optimizer"])
-            lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+            ema_model.averaged_model.load_state_dict(
+                ckpt.get("ema_noise_net", ckpt["noise_net"]))
+            ema_model.optimization_step = ckpt.get("ema_step", ema_model.optimization_step)
+            if "optimizer" in ckpt and "lr_scheduler" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+            else:
+                print("  Resume checkpoint has weights only; optimizer state not restored")
             state_norm.load_state_dict(ckpt["state_normalizer"])
             action_norm.load_state_dict(ckpt["action_normalizer"])
             start_epoch = ckpt["epoch"] + 1
             global_step = ckpt["global_step"]
             best_loss = ckpt["best_loss"]
+            best_meta = load_best_metadata(cfg.output_dir)
+            if best_meta is not None and best_meta["best_loss"] < best_loss:
+                best_loss = best_meta["best_loss"]
+                print(f"  Preserving lower best loss from best_meta.json: {best_loss:.6f}")
             print(f"  Resumed at epoch {start_epoch}, step {global_step}, "
                   f"best_loss={best_loss:.6f}")
         else:
@@ -237,7 +328,18 @@ def main():
     print(f"  Steps/epoch: {steps_per_epoch}")
     print(f"  Total steps: {total_steps}")
     print(f"  Batch size: {cfg.batch_size}")
+    print(f"  DataLoader workers: {cfg.num_workers}")
+    print(f"  Pin memory: {'ON' if args.pin_memory else 'OFF'}")
+    print(f"  latest.pt cadence: every {args.save_latest_every_epochs} epoch(s)")
+    print(f"  recovery.pt cadence: every {args.save_recovery_every_steps} step(s)")
     print()
+    save_training_status(
+        cfg.output_dir,
+        "running",
+        epoch=start_epoch,
+        global_step=global_step,
+        best_loss=best_loss,
+    )
 
     # Mixed precision disabled — can cause 'Illegal instruction' on some drivers
     use_amp = False
@@ -285,7 +387,7 @@ def main():
                 loss = F.mse_loss(noise_pred, noise)
 
             # Backward with scaled gradients
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(all_params, cfg.grad_clip_norm)
@@ -294,13 +396,25 @@ def main():
             lr_scheduler.step()
             ema_model.step(noise_net)
 
-            # Force CUDA sync to prevent async op accumulation
-            if device.type == "cuda":
+            # Optional sync for debugging CUDA hangs without stalling every step.
+            if (device.type == "cuda" and args.sync_cuda_every_steps > 0
+                    and global_step > 0
+                    and global_step % args.sync_cuda_every_steps == 0):
                 torch.cuda.synchronize()
 
             global_step += 1
             steps_done_this_run += 1
             epoch_losses.append(loss.item())
+
+            if global_step % args.save_recovery_every_steps == 0:
+                save_checkpoint(
+                    os.path.join(cfg.output_dir, "recovery.pt"),
+                    noise_net, vision_encoder, ema_model,
+                    optimizer, lr_scheduler, state_norm, action_norm,
+                    cfg, global_step, epoch, best_loss,
+                    include_optimizer_state=False,
+                    include_ema_state=False)
+                print(f"  -> Saved recovery.pt at step {global_step}")
 
             # Log
             if global_step % cfg.log_every_steps == 0:
@@ -311,6 +425,16 @@ def main():
                 print(f"  step {global_step:>6d}/{total_steps}  "
                       f"loss={loss.item():.6f}  lr={lr_now:.2e}  "
                       f"ETA={format_eta(remaining)}")
+                save_training_status(
+                    cfg.output_dir,
+                    "running",
+                    epoch=epoch + 1,
+                    global_step=global_step,
+                    loss=float(loss.item()),
+                    lr=float(lr_now),
+                    eta_seconds=float(remaining),
+                    best_loss=float(best_loss),
+                )
                 if cfg.use_wandb:
                     import wandb
                     wandb.log({
@@ -325,6 +449,15 @@ def main():
         epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch + 1}/{cfg.num_epochs}  "
               f"avg_loss={avg_loss:.6f}  time={epoch_time:.1f}s")
+        save_training_status(
+            cfg.output_dir,
+            "running",
+            epoch=epoch + 1,
+            global_step=global_step,
+            avg_loss=float(avg_loss),
+            epoch_time_seconds=float(epoch_time),
+            best_loss=float(best_loss),
+        )
 
         if cfg.use_wandb:
             import wandb
@@ -338,15 +471,35 @@ def main():
                 os.path.join(cfg.output_dir, "best.pt"),
                 noise_net, vision_encoder, ema_model,
                 optimizer, lr_scheduler, state_norm, action_norm,
-                cfg, global_step, epoch, best_loss)
+                cfg, global_step, epoch, best_loss,
+                include_optimizer_state=False,
+                include_ema_state=True)
+            save_best_metadata(cfg.output_dir, best_loss, epoch, global_step)
             print(f"  -> Saved best.pt (loss={best_loss:.6f})")
 
-        # Save latest
-        save_checkpoint(
-            os.path.join(cfg.output_dir, "latest.pt"),
-            noise_net, vision_encoder, ema_model,
-            optimizer, lr_scheduler, state_norm, action_norm,
-            cfg, global_step, epoch, best_loss)
+        epochs_this_run = epoch - start_epoch + 1
+        should_save_latest = (
+            (epoch + 1) % args.save_latest_every_epochs == 0
+            or (epoch + 1) == cfg.num_epochs
+            or epochs_this_run >= args.epochs_per_run
+        )
+        if should_save_latest:
+            save_checkpoint(
+                os.path.join(cfg.output_dir, "latest.pt"),
+                noise_net, vision_encoder, ema_model,
+                optimizer, lr_scheduler, state_norm, action_norm,
+                cfg, global_step, epoch, best_loss,
+                include_optimizer_state=True,
+                include_ema_state=True)
+            print("  -> Saved latest.pt")
+            save_training_status(
+                cfg.output_dir,
+                "running",
+                epoch=epoch + 1,
+                global_step=global_step,
+                best_loss=float(best_loss),
+                latest_checkpoint="latest.pt",
+            )
 
         # Periodic memory cleanup
         if device.type == "cuda":
@@ -358,14 +511,37 @@ def main():
                 os.path.join(cfg.output_dir, f"epoch_{epoch + 1:04d}.pt"),
                 noise_net, vision_encoder, ema_model,
                 optimizer, lr_scheduler, state_norm, action_norm,
-                cfg, global_step, epoch, best_loss)
+                cfg, global_step, epoch, best_loss,
+                include_optimizer_state=False,
+                include_ema_state=True)
             print(f"  -> Saved epoch_{epoch + 1:04d}.pt")
+
+        # Auto-restart: exit after N epochs to avoid GPU driver hang
+        if epochs_this_run >= args.epochs_per_run and (epoch + 1) < cfg.num_epochs:
+            print(f"\n  Auto-restart: completed {epochs_this_run} epochs this run.")
+            print(f"  Exiting cleanly for restart (epoch {epoch + 1}/{cfg.num_epochs})...")
+            save_training_status(
+                cfg.output_dir,
+                "restarting",
+                epoch=epoch + 1,
+                global_step=global_step,
+                best_loss=float(best_loss),
+            )
+            sys.exit(42)  # special exit code for restart
 
     total_time = time.time() - train_start
     print(f"\n=== Training complete ===")
     print(f"  Total time: {format_eta(total_time)}")
     print(f"  Best loss: {best_loss:.6f}")
     print(f"  Checkpoints in: {cfg.output_dir}")
+    save_training_status(
+        cfg.output_dir,
+        "completed",
+        epoch=cfg.num_epochs,
+        global_step=global_step,
+        best_loss=float(best_loss),
+        total_time_seconds=float(total_time),
+    )
 
     if cfg.use_wandb:
         import wandb

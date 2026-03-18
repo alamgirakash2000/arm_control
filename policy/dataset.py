@@ -10,6 +10,12 @@ import torch
 from torch.utils.data import Dataset
 
 
+def _float_tensor_from_array(array, shape):
+    """Create a float32 tensor without relying on torch.from_numpy."""
+    contiguous = np.ascontiguousarray(array, dtype=np.float32)
+    return torch.frombuffer(memoryview(contiguous), dtype=torch.float32).reshape(shape).clone()
+
+
 class PiperDataset(Dataset):
     """Loads parquet + mp4 episodes and returns windowed observation-action pairs.
 
@@ -136,21 +142,23 @@ class PiperDataset(Dataset):
         ep_idx, t = self.samples[idx]
         To = self.obs_horizon
         Tp = self.pred_horizon
+        H, W = self.image_size
 
         # Observation: past To timesteps [t-To+1, ..., t]
         obs_state = self.states[ep_idx][t - To + 1: t + 1].copy()  # (To, 7)
 
         # Images: past To timesteps (from memory-mapped array)
-        obs_images = np.empty((To, 3, *self.image_size), dtype=np.float32)
+        obs_images = torch.empty((To, 3, H, W), dtype=torch.float32)
         for j, i in enumerate(range(t - To + 1, t + 1)):
-            img = self.frame_maps[ep_idx][i]       # mmap read, uint8 (H, W, 3)
-            obs_images[j] = np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0
+            img = np.array(self.frame_maps[ep_idx][i], copy=True)  # (H, W, 3) uint8
+            img_t = torch.frombuffer(memoryview(img), dtype=torch.uint8).reshape(H, W, 3)
+            obs_images[j].copy_(img_t.permute(2, 0, 1).to(dtype=torch.float32).div(255.0))
 
         # Action: next Tp timesteps [t+1, ..., t+Tp]
         action = self.actions[ep_idx][t: t + Tp].copy()  # (Tp, 7)
 
         return {
-            "obs_state": torch.from_numpy(obs_state),
-            "obs_image": torch.from_numpy(obs_images),
-            "action": torch.from_numpy(action),
+            "obs_state": _float_tensor_from_array(obs_state, (To, 7)),
+            "obs_image": obs_images,
+            "action": _float_tensor_from_array(action, (Tp, 7)),
         }
