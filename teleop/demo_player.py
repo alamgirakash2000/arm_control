@@ -48,6 +48,7 @@ from piper_core import (
     JOINT_LOWER,
     JOINT_UPPER,
     RAD_TO_MDEG,
+    J6_PHYSICAL_OFFSET,
     forward_kinematics,
     rotation_to_euler,
 )
@@ -197,10 +198,15 @@ class ReplayController:
                 try:
                     margin = math.radians(2.0)
                     q_clamped = [max(JOINT_LOWER[j] + margin, min(JOINT_UPPER[j] - margin, q_interp[j])) for j in range(6)]
-                    jcmds = [round(q * RAD_TO_MDEG) for q in q_clamped]
+                    q_physical = list(q_clamped)
+                    q_physical[5] += J6_PHYSICAL_OFFSET  # logical → firmware
+                    jcmds = [round(q * RAD_TO_MDEG) for q in q_physical]
                     self._piper.MotionCtrl_2(0x01, 0x01, self._speed, 0x00)
                     self._piper.JointCtrl(*jcmds)
-                    self._piper.GripperCtrl(round(g_interp * 35000), 1000, 0x01, 0)
+                except Exception:
+                    pass
+                try:
+                    self._piper.GripperCtrl(round(g_interp * 70000), 1000, 0x01, 0)
                 except Exception:
                     pass
             time.sleep(1.0 / self._hz)

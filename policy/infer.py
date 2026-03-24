@@ -24,13 +24,13 @@ from diffusers import DDIMScheduler
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "teleop"))
 
 from piper_core import (PiperHangingController, HOME_POSITION,
-                         JOINT_LOWER, JOINT_UPPER, RAD_TO_MDEG)
+                         JOINT_LOWER, JOINT_UPPER, RAD_TO_MDEG, J6_PHYSICAL_OFFSET)
 from model import VisionEncoder, ConditionalUnet1D
 from normalizer import MinMaxNormalizer
 
 
 JOINT_MARGIN = math.radians(3.0)
-GRIPPER_MAX_MM = 40.0
+GRIPPER_MAX_MM = 70.0
 
 
 class PolicyCommander:
@@ -80,7 +80,9 @@ class PolicyCommander:
                     for j in range(6):
                         a = self.JOINT_ALPHA[j]
                         self._smooth_q[j] = a * q[j] + (1 - a) * self._smooth_q[j]
-                jcmds = [round(v * RAD_TO_MDEG) for v in self._smooth_q]
+                q_physical = list(self._smooth_q)
+                q_physical[5] += J6_PHYSICAL_OFFSET  # logical → firmware
+                jcmds = [round(v * RAD_TO_MDEG) for v in q_physical]
                 self._piper.MotionCtrl_2(0x01, 0x01, self._speed, 0x00)
                 self._piper.JointCtrl(*jcmds)
             if g is not None:
@@ -218,8 +220,8 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--can", type=str, default="can0")
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--max_steps", type=int, default=600,
-                        help="Max control steps (at 20Hz, 600 = 30 seconds)")
+    parser.add_argument("--max_steps", type=int, default=1200,
+                        help="Max control steps (at 20Hz, 1200 = 60 seconds)")
     parser.add_argument("--speed", type=int, default=50)
     parser.add_argument("--no_robot", action="store_true",
                         help="Dry run without robot (camera only)")

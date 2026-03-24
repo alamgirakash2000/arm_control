@@ -9,10 +9,22 @@ Usage:
 
 import argparse
 import copy
+import gc
 import json
+import math
 import os
+import shutil
+import subprocess
 import sys
 import time
+
+# Keep CPU-side libraries on conservative ISA/threading defaults.
+# Training is GPU-bound here, so this trades a little host throughput for stability.
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+os.environ.setdefault("DNNL_MAX_CPU_ISA", "AVX2")
+os.environ.setdefault("ONEDNN_MAX_CPU_ISA", "AVX2")
+os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX2")
 
 import numpy as np
 import torch
@@ -38,8 +50,8 @@ def parse_args():
     p.add_argument("--action_horizon", type=int, default=None)
     p.add_argument("--resume", type=str, default=None,
                    help="Checkpoint to resume from (path or 'latest')")
-    p.add_argument("--epochs_per_run", type=int, default=20,
-                   help="Max epochs per process (restarts to avoid GPU hangs)")
+    p.add_argument("--epochs_per_run", type=int, default=0,
+                   help="Max epochs per process before clean restart; 0 disables restarts")
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--pin_memory", action="store_true")
     p.add_argument("--save_every_epochs", type=int, default=None)
@@ -48,7 +60,17 @@ def parse_args():
     p.add_argument("--save_recovery_every_steps", type=int, default=200,
                    help="How often to save recovery.pt (weights-only crash resume)")
     p.add_argument("--sync_cuda_every_steps", type=int, default=0,
-                   help="Optional CUDA sync cadence for debugging; 0 disables it")
+                   help="CUDA sync cadence for stability/debugging; 0 disables it")
+    p.add_argument("--nice_level", type=int, default=10,
+                   help="Lower CPU priority by this amount; 0 disables it")
+    p.add_argument("--cpu_threads", type=int, default=None,
+                   help="Max PyTorch CPU threads; default keeps desktop responsive")
+    p.add_argument("--interop_threads", type=int, default=1,
+                   help="PyTorch inter-op thread count")
+    p.add_argument("--opencv_threads", type=int, default=1,
+                   help="OpenCV thread count")
+    p.add_argument("--ionice", action=argparse.BooleanOptionalAction, default=True,
+                   help="Lower I/O priority on Linux when ionice is available")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -56,8 +78,34 @@ def parse_args():
 
 def atomic_torch_save(payload, path):
     tmp_path = f"{path}.tmp"
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, path)
+    last_error = None
+    for attempt in range(3):
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+            return
+        except Exception as exc:
+            last_error = exc
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            if attempt == 2:
+                break
+            gc.collect()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            time.sleep(0.5 * (attempt + 1))
+    raise last_error
 
 
 def atomic_json_save(payload, path):
@@ -67,16 +115,118 @@ def atomic_json_save(payload, path):
     os.replace(tmp_path, path)
 
 
+def _module_state_dict_to_cpu(module):
+    return {name: _tensor_tree_to_cpu(value) for name, value in module.state_dict().items()}
+
+
+def _tensor_tree_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, np.ndarray):
+        return np.array(value, copy=True)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {k: _tensor_tree_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_tensor_tree_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_tensor_tree_to_cpu(v) for v in value)
+    return value
+
+
+def try_save_checkpoint(label, path, noise_net, vision_encoder, ema_model,
+                        optimizer, lr_scheduler, state_norm, action_norm,
+                        config, global_step, epoch, best_loss,
+                        include_optimizer_state=True,
+                        include_ema_state=True):
+    try:
+        save_checkpoint(
+            path,
+            noise_net,
+            vision_encoder,
+            ema_model,
+            optimizer,
+            lr_scheduler,
+            state_norm,
+            action_norm,
+            config,
+            global_step,
+            epoch,
+            best_loss,
+            include_optimizer_state=include_optimizer_state,
+            include_ema_state=include_ema_state,
+        )
+        return True
+    except Exception as exc:
+        print(f"  WARNING: failed to save {label}: {exc}")
+        return False
+
+
+def _optimizer_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device, non_blocking=(device.type == "cuda"))
+
+
+def configure_runtime(args):
+    cpu_threads = args.cpu_threads
+    if cpu_threads is None:
+        cpu_count = os.cpu_count() or 4
+        cpu_threads = max(1, min(4, cpu_count // 2 if cpu_count > 1 else 1))
+    cpu_threads = max(1, cpu_threads)
+
+    interop_threads = max(1, args.interop_threads)
+    opencv_threads = max(1, args.opencv_threads)
+
+    if args.nice_level > 0:
+        try:
+            os.nice(args.nice_level)
+        except OSError:
+            pass
+
+    if args.ionice and sys.platform.startswith("linux"):
+        ionice_bin = shutil.which("ionice")
+        if ionice_bin is not None:
+            subprocess.run(
+                [ionice_bin, "-c2", "-n7", "-p", str(os.getpid())],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+    torch.set_num_threads(cpu_threads)
+    try:
+        torch.set_num_interop_threads(interop_threads)
+    except RuntimeError:
+        pass
+
+    try:
+        import cv2
+        cv2.setNumThreads(opencv_threads)
+    except Exception:
+        pass
+
+    return {
+        "cpu_threads": cpu_threads,
+        "interop_threads": interop_threads,
+        "opencv_threads": opencv_threads,
+        "nice_level": args.nice_level,
+        "ionice": args.ionice,
+    }
+
+
 def save_checkpoint(path, noise_net, vision_encoder, ema_model,
                     optimizer, lr_scheduler, state_norm, action_norm,
                     config, global_step, epoch, best_loss,
                     include_optimizer_state=True,
                     include_ema_state=True):
     payload = {
-        "noise_net": noise_net.state_dict(),
-        "vision_encoder": vision_encoder.state_dict(),
-        "state_normalizer": state_norm.state_dict(),
-        "action_normalizer": action_norm.state_dict(),
+        "noise_net": _module_state_dict_to_cpu(noise_net),
+        "vision_encoder": _module_state_dict_to_cpu(vision_encoder),
+        "state_normalizer": _tensor_tree_to_cpu(state_norm.state_dict()),
+        "action_normalizer": _tensor_tree_to_cpu(action_norm.state_dict()),
         "config": {
             "obs_horizon": config.obs_horizon,
             "pred_horizon": config.pred_horizon,
@@ -99,16 +249,46 @@ def save_checkpoint(path, noise_net, vision_encoder, ema_model,
         "ema_step": ema_model.optimization_step,
     }
     if include_ema_state:
-        payload["ema_noise_net"] = ema_model.averaged_model.state_dict()
+        payload["ema_noise_net"] = _module_state_dict_to_cpu(ema_model.averaged_model)
     if include_optimizer_state:
-        payload["optimizer"] = optimizer.state_dict()
-        payload["lr_scheduler"] = lr_scheduler.state_dict()
+        payload["optimizer"] = _tensor_tree_to_cpu(optimizer.state_dict())
+        payload["lr_scheduler"] = _tensor_tree_to_cpu(lr_scheduler.state_dict())
     atomic_torch_save(payload, path)
 
 
-def load_checkpoint(path, device):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    return ckpt
+def load_checkpoint(path):
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def resolve_resume_checkpoint(output_dir, resume_arg):
+    if resume_arg != "latest":
+        return resume_arg
+
+    latest_path = os.path.join(output_dir, "latest.pt")
+    recovery_path = os.path.join(output_dir, "recovery.pt")
+    candidates = [path for path in (latest_path, recovery_path) if os.path.exists(path)]
+    if not candidates:
+        return latest_path
+    return max(candidates, key=os.path.getmtime)
+
+
+def fast_forward_lr_scheduler(lr_scheduler, step_count):
+    if step_count <= 0:
+        return
+
+    if isinstance(lr_scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+        eta_min = lr_scheduler.eta_min
+        t_max = lr_scheduler.T_max
+        new_lrs = []
+        for param_group, base_lr in zip(lr_scheduler.optimizer.param_groups, lr_scheduler.base_lrs):
+            lr = eta_min + (base_lr - eta_min) * (1 + math.cos(math.pi * step_count / t_max)) / 2
+            param_group["lr"] = lr
+            new_lrs.append(lr)
+        lr_scheduler.last_epoch = step_count
+        lr_scheduler._last_lr = new_lrs
+        return
+
+    lr_scheduler.step(step_count)
 
 
 def save_best_metadata(output_dir, best_loss, epoch, global_step):
@@ -173,10 +353,22 @@ def main():
     # Seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if args.epochs_per_run < 0:
+        raise ValueError("--epochs_per_run must be >= 0")
+    if args.nice_level < 0:
+        raise ValueError("--nice_level must be >= 0")
+    if args.interop_threads < 1:
+        raise ValueError("--interop_threads must be >= 1")
+    if args.opencv_threads < 1:
+        raise ValueError("--opencv_threads must be >= 1")
+    if args.sync_cuda_every_steps < 0:
+        raise ValueError("--sync_cuda_every_steps must be >= 0")
     if args.save_latest_every_epochs < 1:
         raise ValueError("--save_latest_every_epochs must be >= 1")
     if args.save_recovery_every_steps < 1:
         raise ValueError("--save_recovery_every_steps must be >= 1")
+
+    runtime_cfg = configure_runtime(args)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -247,6 +439,7 @@ def main():
     ).to(device)
     ema_model = EMAModel(noise_net, power=cfg.ema_power)
     ema_model.averaged_model.to(device)
+    ema_model.refresh_parameter_cache(noise_net)
 
     n_vis = sum(p.numel() for p in vision_encoder.parameters())
     n_unet = sum(p.numel() for p in noise_net.parameters())
@@ -280,30 +473,39 @@ def main():
 
     # Resume
     if args.resume:
-        ckpt_path = args.resume
-        if ckpt_path == "latest":
-            ckpt_path = os.path.join(cfg.output_dir, "latest.pt")
-            if not os.path.exists(ckpt_path):
-                recovery_path = os.path.join(cfg.output_dir, "recovery.pt")
-                if os.path.exists(recovery_path):
-                    ckpt_path = recovery_path
+        ckpt_path = resolve_resume_checkpoint(cfg.output_dir, args.resume)
         if os.path.exists(ckpt_path):
             print(f"\nResuming from {ckpt_path}")
-            ckpt = load_checkpoint(ckpt_path, device)
+            ckpt = load_checkpoint(ckpt_path)
+            is_recovery_checkpoint = os.path.basename(ckpt_path) == "recovery.pt"
+            optimizer_state_restored = False
             noise_net.load_state_dict(ckpt["noise_net"])
             vision_encoder.load_state_dict(ckpt["vision_encoder"])
             ema_model.averaged_model.load_state_dict(
                 ckpt.get("ema_noise_net", ckpt["noise_net"]))
             ema_model.optimization_step = ckpt.get("ema_step", ema_model.optimization_step)
+            ema_model.refresh_parameter_cache(noise_net)
             if "optimizer" in ckpt and "lr_scheduler" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer"])
                 lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+                _optimizer_to_device(optimizer, device)
+                optimizer_state_restored = True
             else:
                 print("  Resume checkpoint has weights only; optimizer state not restored")
             state_norm.load_state_dict(ckpt["state_normalizer"])
             action_norm.load_state_dict(ckpt["action_normalizer"])
-            start_epoch = ckpt["epoch"] + 1
-            global_step = ckpt["global_step"]
+            start_epoch = ckpt["epoch"] if is_recovery_checkpoint else ckpt["epoch"] + 1
+            if is_recovery_checkpoint:
+                global_step = ckpt["epoch"] * len(dataloader)
+                print(f"  Recovery checkpoint rewinds to epoch {start_epoch} start")
+            else:
+                global_step = ckpt["global_step"]
+            if not optimizer_state_restored and global_step > 0:
+                fast_forward_lr_scheduler(lr_scheduler, global_step)
+                print(
+                    f"  Fast-forwarded LR scheduler to step {global_step} "
+                    f"(lr={lr_scheduler.get_last_lr()[0]:.2e})"
+                )
             best_loss = ckpt["best_loss"]
             best_meta = load_best_metadata(cfg.output_dir)
             if best_meta is not None and best_meta["best_loss"] < best_loss:
@@ -311,6 +513,7 @@ def main():
                 print(f"  Preserving lower best loss from best_meta.json: {best_loss:.6f}")
             print(f"  Resumed at epoch {start_epoch}, step {global_step}, "
                   f"best_loss={best_loss:.6f}")
+            del ckpt
         else:
             print(f"WARNING: Checkpoint {ckpt_path} not found, training from scratch")
 
@@ -330,8 +533,22 @@ def main():
     print(f"  Batch size: {cfg.batch_size}")
     print(f"  DataLoader workers: {cfg.num_workers}")
     print(f"  Pin memory: {'ON' if args.pin_memory else 'OFF'}")
+    print(f"  CPU threads: {runtime_cfg['cpu_threads']}")
+    print(f"  Inter-op threads: {runtime_cfg['interop_threads']}")
+    print(f"  OpenCV threads: {runtime_cfg['opencv_threads']}")
+    print(f"  Nice level: {runtime_cfg['nice_level']}")
+    print(f"  Ionice: {'ON' if runtime_cfg['ionice'] else 'OFF'}")
     print(f"  latest.pt cadence: every {args.save_latest_every_epochs} epoch(s)")
     print(f"  recovery.pt cadence: every {args.save_recovery_every_steps} step(s)")
+    if device.type == "cuda":
+        if args.sync_cuda_every_steps > 0:
+            print(f"  CUDA sync cadence: every {args.sync_cuda_every_steps} step(s)")
+        else:
+            print("  CUDA sync cadence: OFF")
+    if args.epochs_per_run > 0:
+        print(f"  Auto-restart cadence: every {args.epochs_per_run} epoch(s)")
+    else:
+        print("  Auto-restart cadence: OFF")
     print()
     save_training_status(
         cfg.output_dir,
@@ -398,7 +615,6 @@ def main():
 
             # Optional sync for debugging CUDA hangs without stalling every step.
             if (device.type == "cuda" and args.sync_cuda_every_steps > 0
-                    and global_step > 0
                     and global_step % args.sync_cuda_every_steps == 0):
                 torch.cuda.synchronize()
 
@@ -407,14 +623,16 @@ def main():
             epoch_losses.append(loss.item())
 
             if global_step % args.save_recovery_every_steps == 0:
-                save_checkpoint(
+                if try_save_checkpoint(
+                    "recovery.pt",
                     os.path.join(cfg.output_dir, "recovery.pt"),
                     noise_net, vision_encoder, ema_model,
                     optimizer, lr_scheduler, state_norm, action_norm,
                     cfg, global_step, epoch, best_loss,
                     include_optimizer_state=False,
-                    include_ema_state=False)
-                print(f"  -> Saved recovery.pt at step {global_step}")
+                    include_ema_state=False,
+                ):
+                    print(f"  -> Saved recovery.pt at step {global_step}")
 
             # Log
             if global_step % cfg.log_every_steps == 0:
@@ -466,40 +684,72 @@ def main():
 
         # Save best
         if avg_loss < best_loss:
-            best_loss = avg_loss
-            save_checkpoint(
+            candidate_best_loss = avg_loss
+            if try_save_checkpoint(
+                "best.pt",
                 os.path.join(cfg.output_dir, "best.pt"),
                 noise_net, vision_encoder, ema_model,
                 optimizer, lr_scheduler, state_norm, action_norm,
-                cfg, global_step, epoch, best_loss,
+                cfg, global_step, epoch, candidate_best_loss,
                 include_optimizer_state=False,
-                include_ema_state=True)
-            save_best_metadata(cfg.output_dir, best_loss, epoch, global_step)
-            print(f"  -> Saved best.pt (loss={best_loss:.6f})")
+                include_ema_state=True,
+            ):
+                best_loss = candidate_best_loss
+                save_best_metadata(cfg.output_dir, best_loss, epoch, global_step)
+                print(f"  -> Saved best.pt (loss={best_loss:.6f})")
+            else:
+                print(
+                    "  WARNING: best loss improved, but checkpoint save failed; "
+                    "keeping previous best.pt"
+                )
 
         epochs_this_run = epoch - start_epoch + 1
         should_save_latest = (
             (epoch + 1) % args.save_latest_every_epochs == 0
             or (epoch + 1) == cfg.num_epochs
-            or epochs_this_run >= args.epochs_per_run
+            or (args.epochs_per_run > 0 and epochs_this_run >= args.epochs_per_run)
         )
         if should_save_latest:
-            save_checkpoint(
-                os.path.join(cfg.output_dir, "latest.pt"),
+            latest_path = os.path.join(cfg.output_dir, "latest.pt")
+            latest_saved = try_save_checkpoint(
+                "latest.pt",
+                latest_path,
                 noise_net, vision_encoder, ema_model,
                 optimizer, lr_scheduler, state_norm, action_norm,
                 cfg, global_step, epoch, best_loss,
                 include_optimizer_state=True,
-                include_ema_state=True)
-            print("  -> Saved latest.pt")
-            save_training_status(
-                cfg.output_dir,
-                "running",
-                epoch=epoch + 1,
-                global_step=global_step,
-                best_loss=float(best_loss),
-                latest_checkpoint="latest.pt",
+                include_ema_state=True,
             )
+            if latest_saved:
+                print("  -> Saved latest.pt")
+                save_training_status(
+                    cfg.output_dir,
+                    "running",
+                    epoch=epoch + 1,
+                    global_step=global_step,
+                    best_loss=float(best_loss),
+                    latest_checkpoint="latest.pt",
+                )
+            else:
+                latest_saved = try_save_checkpoint(
+                    "latest.pt (weights-only fallback)",
+                    latest_path,
+                    noise_net, vision_encoder, ema_model,
+                    optimizer, lr_scheduler, state_norm, action_norm,
+                    cfg, global_step, epoch, best_loss,
+                    include_optimizer_state=False,
+                    include_ema_state=True,
+                )
+                if latest_saved:
+                    print("  -> Saved latest.pt (weights-only fallback)")
+                    save_training_status(
+                        cfg.output_dir,
+                        "running",
+                        epoch=epoch + 1,
+                        global_step=global_step,
+                        best_loss=float(best_loss),
+                        latest_checkpoint="latest.pt",
+                    )
 
         # Periodic memory cleanup
         if device.type == "cuda":
@@ -507,17 +757,21 @@ def main():
 
         # Periodic checkpoint
         if (epoch + 1) % cfg.save_every_epochs == 0:
-            save_checkpoint(
+            if try_save_checkpoint(
+                f"epoch_{epoch + 1:04d}.pt",
                 os.path.join(cfg.output_dir, f"epoch_{epoch + 1:04d}.pt"),
                 noise_net, vision_encoder, ema_model,
                 optimizer, lr_scheduler, state_norm, action_norm,
                 cfg, global_step, epoch, best_loss,
                 include_optimizer_state=False,
-                include_ema_state=True)
-            print(f"  -> Saved epoch_{epoch + 1:04d}.pt")
+                include_ema_state=True,
+            ):
+                print(f"  -> Saved epoch_{epoch + 1:04d}.pt")
 
         # Auto-restart: exit after N epochs to avoid GPU driver hang
-        if epochs_this_run >= args.epochs_per_run and (epoch + 1) < cfg.num_epochs:
+        if (args.epochs_per_run > 0
+                and epochs_this_run >= args.epochs_per_run
+                and (epoch + 1) < cfg.num_epochs):
             print(f"\n  Auto-restart: completed {epochs_this_run} epochs this run.")
             print(f"  Exiting cleanly for restart (epoch {epoch + 1}/{cfg.num_epochs})...")
             save_training_status(

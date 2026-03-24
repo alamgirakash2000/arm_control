@@ -33,7 +33,7 @@ class DiffusionPolicyConfig:
     beta_schedule: str = "squaredcos_cap_v2"
 
     # Training
-    batch_size: int = 32
+    batch_size: int = 16
     num_epochs: int = 500
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6

@@ -11,9 +11,7 @@ from torch.utils.data import Dataset
 
 
 def _float_tensor_from_array(array, shape):
-    """Create a float32 tensor without relying on torch.from_numpy."""
-    contiguous = np.ascontiguousarray(array, dtype=np.float32)
-    return torch.frombuffer(memoryview(contiguous), dtype=torch.float32).reshape(shape).clone()
+    return torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32)).reshape(shape)
 
 
 class PiperDataset(Dataset):
@@ -79,17 +77,15 @@ class PiperDataset(Dataset):
                                  f"episode_{ep_idx:06d}.mp4")
 
             if os.path.exists(cache_path):
-                # Fast path: memory-map existing cache
-                frames_mmap = np.load(cache_path, mmap_mode='r')
+                frames_arr = np.load(cache_path, mmap_mode="r", allow_pickle=False)
             else:
-                # First run: extract frames, save to cache, then mmap
                 frames = self._load_video(vpath, len(states))
                 frames_arr = np.stack(frames)  # (T, H, W, 3) uint8
                 np.save(cache_path, frames_arr)
                 del frames, frames_arr
-                frames_mmap = np.load(cache_path, mmap_mode='r')
+                frames_arr = np.load(cache_path, mmap_mode="r", allow_pickle=False)
 
-            self.frame_maps.append(frames_mmap)
+            self.frame_maps.append(frames_arr)
 
             if (ep_idx + 1) % 10 == 0:
                 print(f"  Loaded {ep_idx + 1}/{len(episodes)} episodes")
@@ -151,8 +147,8 @@ class PiperDataset(Dataset):
         obs_images = torch.empty((To, 3, H, W), dtype=torch.float32)
         for j, i in enumerate(range(t - To + 1, t + 1)):
             img = np.array(self.frame_maps[ep_idx][i], copy=True)  # (H, W, 3) uint8
-            img_t = torch.frombuffer(memoryview(img), dtype=torch.uint8).reshape(H, W, 3)
-            obs_images[j].copy_(img_t.permute(2, 0, 1).to(dtype=torch.float32).div(255.0))
+            img_t = torch.from_numpy(img).permute(2, 0, 1).float().div(255.0)
+            obs_images[j].copy_(img_t)
 
         # Action: next Tp timesteps [t+1, ..., t+Tp]
         action = self.actions[ep_idx][t: t + Tp].copy()  # (Tp, 7)

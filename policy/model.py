@@ -320,14 +320,36 @@ class EMAModel:
         self.averaged_model.eval()
         self.power = power
         self.optimization_step = 0
+        self._param_pairs = None
+
+    def refresh_parameter_cache(self, model):
+        ema_named = tuple(self.averaged_model.named_parameters())
+        model_named = tuple(model.named_parameters())
+
+        if len(ema_named) != len(model_named):
+            raise ValueError(
+                "EMA/model parameter count mismatch: "
+                f"{len(ema_named)} vs {len(model_named)}"
+            )
+
+        param_pairs = []
+        for (ema_name, ema_param), (model_name, model_param) in zip(ema_named, model_named):
+            if ema_name != model_name:
+                raise ValueError(
+                    "EMA/model parameter name mismatch: "
+                    f"{ema_name!r} vs {model_name!r}"
+                )
+            param_pairs.append((ema_param, model_param))
+        self._param_pairs = tuple(param_pairs)
 
     def get_decay(self, step):
         return 1 - (1 + step) ** (-self.power)
 
     @torch.no_grad()
     def step(self, model):
+        if self._param_pairs is None:
+            self.refresh_parameter_cache(model)
         self.optimization_step += 1
         decay = self.get_decay(self.optimization_step)
-        for ema_p, model_p in zip(self.averaged_model.parameters(),
-                                  model.parameters()):
+        for ema_p, model_p in self._param_pairs:
             ema_p.data.mul_(decay).add_(model_p.data, alpha=1.0 - decay)

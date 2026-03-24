@@ -15,6 +15,17 @@ Train and deploy diffusion policies for the Piper robot arm sub-tasks (pick, ins
 
 ## Training
 
+
+```bash
+# Working command
+conda run --no-capture-output -n armcontrol-train-gpu-wheel-py310-cu124 \
+  python policy/train.py \
+  --dataset_dir ./data/pick \
+  --output_dir ./checkpoints/pick_safe \
+  --resume latest \
+  --epochs 500
+```
+
 ```bash
 # Recommended: watchdog supervisor with auto-resume on crashes/stalls
 bash policy/train_loop.sh ./data/pick ./checkpoints/pick 500 20

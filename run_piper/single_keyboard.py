@@ -155,7 +155,7 @@ def main():
         print("  Relaxing before exit (safe -> elbow -> relax) ...", end=" ", flush=True)
         try:
             ctrl.send_joints(SAFE_POSITION, timeout=8.0)
-            ctrl.send_joints([0.0, 0.0, JOINT_LOWER[2], 0.0, 0.0, 0.0], timeout=8.0)
+            ctrl.send_joints([0.0, 0.0, JOINT_LOWER[2], 0.0, 0.0, RELAX_POSITION[5]], timeout=8.0)
             ctrl.send_joints(RELAX_POSITION, timeout=8.0)
             print("Done")
         except Exception:

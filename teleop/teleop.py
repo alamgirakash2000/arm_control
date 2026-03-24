@@ -52,6 +52,7 @@ from piper_core import (
     ik_solve,
     T_BASE,
     RAD_TO_MDEG,
+    J6_PHYSICAL_OFFSET,
 )
 
 from relay_server import pose_store, start_server
@@ -89,13 +90,15 @@ def _say(text, wait=False):
 
 DEFAULT_SCALE      = 1.0
 DEFAULT_ROT_SCALE  = 1.0
-DEFAULT_SPEED      = 50
-DEFAULT_SMOOTHING  = 0.5
-GRIPPER_MAX_MM     = 40.0
+DEFAULT_SPEED      = 70
+DEFAULT_SMOOTHING  = 0.08     # lower = smoother (was 0.15)
+GRIPPER_MAX_MM     = 70.0
 GRIPPER_DEADBAND   = 2.0      # %
-DEADBAND_CM        = 0.0      # cm — per-axis EMA deadband
-MOVE_THRESH_CM     = 0.0      # cm — per-axis position threshold (0 = always update)
-ROT_THRESH_DEG     = 0.0      # deg — rotation threshold (0 = always update)
+DEADBAND_CM        = 0.5      # cm — per-axis EMA deadband (was 0.3)
+MOVE_THRESH_CM     = 0.25     # cm — per-axis position threshold (was 0.15)
+ROT_THRESH_DEG     = 1.0      # deg — rotation threshold (was 0.5)
+MAX_POS_STEP_CM    = 1.0      # cm — max position change per update (velocity cap)
+MAX_ROT_STEP_DEG   = 2.5      # deg — max rotation change per update (velocity cap)
 UPDATE_INTERVAL    = 0.025    # seconds between accepting new targets (40 Hz)
 HOLD_HZ            = 30       # Hz — rate to resend current target
 DISPLAY_HZ         = 10        # terminal print rate
@@ -103,13 +106,16 @@ REF_SECS           = 2.5      # seconds to average for home pose capture
 STALE_MS           = 500.0    # pose data older than this = tracking lost
 MAX_POS_DELTA_CM   = 100.0    # generous backstop (joint limits are the real safety)
 MAX_ROT_DELTA_DEG  = 180.0    # generous backstop (joint limits are the real safety)
-JOINT_LIMIT_MARGIN = math.radians(3.0)  # 3° margin from each joint limit
+# Per-joint limit margins (J1-J6). J4=10°, J5=5°, others=10°.
+JOINT_LIMIT_MARGINS = [math.radians(d) for d in [10.0, 10.0, 10.0, 10.0, 5.0, 10.0]]
+# IK solver margins: larger for J5 (only 180° range) to keep IK solutions away from the edge.
+IK_JOINT_MARGINS    = [math.radians(d) for d in [10.0, 10.0, 10.0, 10.0, 15.0, 10.0]]
 
 # IK joint-space smoothing: per-joint EMA rate (0=frozen, 1=instant)
 # J4 (forearm twist) tracks slower to prevent slamming into limits
-IK_JOINT_ALPHA   = [0.35, 0.35, 0.35, 0.2, 0.35, 0.35]
-# IK joint weights: higher = joint moves less (penalizes J4 2x)
-IK_JOINT_WEIGHTS = [1.0, 1.0, 1.0, 2.0, 1.0, 1.0]
+IK_JOINT_ALPHA   = [0.08, 0.08, 0.08, 0.06, 0.06, 0.08]  # J4+J5 track slower (was 0.08)
+# IK joint weights: higher = joint moves less (penalizes J4+J5 to prevent limit-hitting)
+IK_JOINT_WEIGHTS = [1.0, 1.0, 1.0, 4.0, 4.0, 1.0]        # J4+J5: 4x penalty (was 2x/1x)
 
 # ── VR-to-Robot frame transform ──────────────────────────────────────────────
 # OpenVR: X=right, Y=up, −Z=forward
@@ -212,11 +218,11 @@ def remap(pos_delta_m, axis_map):
     return np.array([pos_delta_m[ax] * sign for ax, sign in axis_map])
 
 
-def check_joint_limits(ctrl, margin=JOINT_LIMIT_MARGIN):
+def check_joint_limits(ctrl, margins=JOINT_LIMIT_MARGINS):
     """Read robot joints and check if any are near limits.
 
     Args:
-        margin: fixed angular margin in radians (same for every joint)
+        margins: per-joint angular margins in radians
 
     Returns (near_limit, near_details) where near_details is a list of
     (joint_number_1based, 'lo'|'hi') tuples.
@@ -227,9 +233,10 @@ def check_joint_limits(ctrl, margin=JOINT_LIMIT_MARGIN):
         return False, []
     near = []
     for i in range(6):
-        if joints[i] <= JOINT_LOWER[i] + margin:
+        m = margins[i]
+        if joints[i] <= JOINT_LOWER[i] + m:
             near.append((i + 1, 'lo'))
-        elif joints[i] >= JOINT_UPPER[i] - margin:
+        elif joints[i] >= JOINT_UPPER[i] - m:
             near.append((i + 1, 'hi'))
     return len(near) > 0, near
 
@@ -341,7 +348,9 @@ class ArmCommander:
                 grip = self._grip_mm
             if jtgt is not None:
                 try:
-                    jcmds = [round(q * RAD_TO_MDEG) for q in jtgt]
+                    q_physical = list(jtgt)
+                    q_physical[5] += J6_PHYSICAL_OFFSET  # logical → firmware
+                    jcmds = [round(q * RAD_TO_MDEG) for q in q_physical]
                     self._piper.MotionCtrl_2(0x01, 0x01, self._speed, 0x00)
                     self._piper.JointCtrl(*jcmds)
                 except Exception:
@@ -392,8 +401,8 @@ def parse_args():
     p.add_argument("--port",           default=8765, type=int)
     p.add_argument("--host",           default="0.0.0.0")
     # Recording (on by default — use --no-record to disable)
-    p.add_argument("--record",         default="./data/my_task", metavar="DIR",
-                   help="Dataset directory (default: ./data/my_task)")
+    p.add_argument("--record",         default="./data/tool_good", metavar="DIR",
+                   help="Dataset directory (default: ./data/tool_good)")
     p.add_argument("--no-record",      action="store_true",
                    help="Disable recording")
     p.add_argument("--rec-fps",        default=20, type=int,
@@ -879,7 +888,7 @@ def main():
     print(f"  Pos scale  : {scale}    Rot scale: {rot_scale}")
     print(f"  Hold: {HOLD_HZ} Hz   Update: every {UPDATE_INTERVAL}s")
     print(f"  Thresh pos : {MOVE_THRESH_CM} cm    rot: {ROT_THRESH_DEG}°")
-    print(f"  Joint prot : {math.degrees(JOINT_LIMIT_MARGIN):.0f}° margin (reactive monitoring)")
+    print(f"  Joint prot : [{', '.join(f'{math.degrees(m):.0f}' for m in JOINT_LIMIT_MARGINS)}]° per-joint margin")
     print(f"  IK mode    : {'LOCAL (joint ctrl, J2/J3 compensation)' if ik_mode else 'FIRMWARE (Cartesian ctrl)'}")
     print(f"  Smoothing  : {alpha}")
     if with_robot:
@@ -1232,6 +1241,18 @@ def main():
                         safe_pos[hand] = list(new_pos)
                         safe_R[hand] = new_R.copy()
 
+                    # Velocity cap: limit how much target can jump in one update
+                    for i in range(3):
+                        delta = new_pos[i] - com_pos[hand][i]
+                        if abs(delta) > MAX_POS_STEP_CM:
+                            new_pos[i] = com_pos[hand][i] + math.copysign(MAX_POS_STEP_CM, delta)
+                    max_rot_step_rad = math.radians(MAX_ROT_STEP_DEG)
+                    ang_dist = angular_distance(new_R, com_R[hand])
+                    if ang_dist > max_rot_step_rad and ang_dist > 1e-6:
+                        R_rel = new_R @ com_R[hand].T
+                        R_rel_capped = scale_rotation(R_rel, max_rot_step_rad / ang_dist)
+                        new_R = R_rel_capped @ com_R[hand]
+
                     com_pos[hand] = new_pos
                     com_R[hand] = new_R
 
@@ -1264,16 +1285,16 @@ def main():
                         R_w = R_delta_w @ ik_home_R_w
                         q_sol = ik_solve(last_ik_q[hand], pos_w, R_w,
                                          max_iter=50, pos_tol=1e-3, rot_tol=0.02,
-                                         margin=JOINT_LIMIT_MARGIN,
+                                         joint_margins=IK_JOINT_MARGINS,
                                          joint_weights=IK_JOINT_WEIGHTS)
                         if q_sol is not None:
                             last_ik_q[hand] = list(q_sol)
                             for i in range(6):
                                 cmd_q[hand][i] += IK_JOINT_ALPHA[i] * (q_sol[i] - cmd_q[hand][i])
-                        # Hard clamp: NEVER send joints past limit - 3°
+                        # Hard clamp: NEVER send joints past per-joint margin
                         for i in range(6):
-                            lo = JOINT_LOWER[i] + JOINT_LIMIT_MARGIN
-                            hi = JOINT_UPPER[i] - JOINT_LIMIT_MARGIN
+                            lo = JOINT_LOWER[i] + JOINT_LIMIT_MARGINS[i]
+                            hi = JOINT_UPPER[i] - JOINT_LIMIT_MARGINS[i]
                             cmd_q[hand][i] = max(lo, min(hi, cmd_q[hand][i]))
                         cmds[hand].send_joints(cmd_q[hand])
                     else:
