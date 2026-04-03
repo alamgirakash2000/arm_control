@@ -28,6 +28,7 @@ os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX2")
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from diffusers import DDPMScheduler
@@ -135,7 +136,7 @@ def _tensor_tree_to_cpu(value):
     return value
 
 
-def try_save_checkpoint(label, path, noise_net, vision_encoder, ema_model,
+def try_save_checkpoint(label, path, noise_net, vision_encoders, ema_model,
                         optimizer, lr_scheduler, state_norm, action_norm,
                         config, global_step, epoch, best_loss,
                         include_optimizer_state=True,
@@ -144,7 +145,7 @@ def try_save_checkpoint(label, path, noise_net, vision_encoder, ema_model,
         save_checkpoint(
             path,
             noise_net,
-            vision_encoder,
+            vision_encoders,
             ema_model,
             optimizer,
             lr_scheduler,
@@ -217,14 +218,14 @@ def configure_runtime(args):
     }
 
 
-def save_checkpoint(path, noise_net, vision_encoder, ema_model,
+def save_checkpoint(path, noise_net, vision_encoders, ema_model,
                     optimizer, lr_scheduler, state_norm, action_norm,
                     config, global_step, epoch, best_loss,
                     include_optimizer_state=True,
                     include_ema_state=True):
     payload = {
         "noise_net": _module_state_dict_to_cpu(noise_net),
-        "vision_encoder": _module_state_dict_to_cpu(vision_encoder),
+        "vision_encoders": _module_state_dict_to_cpu(vision_encoders),
         "state_normalizer": _tensor_tree_to_cpu(state_norm.state_dict()),
         "action_normalizer": _tensor_tree_to_cpu(action_norm.state_dict()),
         "config": {
@@ -234,6 +235,8 @@ def save_checkpoint(path, noise_net, vision_encoder, ema_model,
             "action_dim": config.action_dim,
             "obs_state_dim": config.obs_state_dim,
             "vision_feature_dim": config.vision_feature_dim,
+            "num_cameras": config.num_cameras,
+            "camera_names": list(config.camera_names),
             "down_dims": list(config.down_dims),
             "diffusion_step_embed_dim": config.diffusion_step_embed_dim,
             "kernel_size": config.kernel_size,
@@ -397,6 +400,7 @@ def main():
         obs_horizon=cfg.obs_horizon,
         pred_horizon=cfg.pred_horizon,
         image_size=cfg.image_size,
+        camera_names=cfg.camera_names,
     )
     dataloader_kwargs = {
         "batch_size": cfg.batch_size,
@@ -419,15 +423,21 @@ def main():
     print(f"  State range: {state_norm.data_min} -> {state_norm.data_max}")
     print(f"  Action range: {action_norm.data_min} -> {action_norm.data_max}")
 
-    # Model
-    global_cond_dim = cfg.obs_horizon * (cfg.vision_feature_dim + cfg.obs_state_dim)
+    # Model — one VisionEncoder per camera, features concatenated
+    num_cams = cfg.num_cameras
+    cam_names = list(cfg.camera_names)[:num_cams]
+    vis_total_dim = num_cams * cfg.vision_feature_dim
+    global_cond_dim = cfg.obs_horizon * (vis_total_dim + cfg.obs_state_dim)
     print(f"\n=== Building model ===")
+    print(f"  Cameras: {cam_names} ({num_cams} x {cfg.vision_feature_dim}-dim)")
     print(f"  Observation: {cfg.obs_horizon} steps x "
-          f"(vision {cfg.vision_feature_dim} + state {cfg.obs_state_dim}) "
+          f"(vision {vis_total_dim} + state {cfg.obs_state_dim}) "
           f"= {global_cond_dim}-dim conditioning")
     print(f"  Action: {cfg.pred_horizon} steps x {cfg.action_dim}-dim")
 
-    vision_encoder = VisionEncoder(out_dim=cfg.vision_feature_dim).to(device)
+    vision_encoders = nn.ModuleDict({
+        cam: VisionEncoder(out_dim=cfg.vision_feature_dim) for cam in cam_names
+    }).to(device)
     noise_net = ConditionalUnet1D(
         input_dim=cfg.action_dim,
         global_cond_dim=global_cond_dim,
@@ -441,9 +451,9 @@ def main():
     ema_model.averaged_model.to(device)
     ema_model.refresh_parameter_cache(noise_net)
 
-    n_vis = sum(p.numel() for p in vision_encoder.parameters())
+    n_vis = sum(p.numel() for p in vision_encoders.parameters())
     n_unet = sum(p.numel() for p in noise_net.parameters())
-    print(f"  Vision encoder: {n_vis / 1e6:.1f}M params")
+    print(f"  Vision encoders ({num_cams}x): {n_vis / 1e6:.1f}M params")
     print(f"  Noise U-Net: {n_unet / 1e6:.1f}M params")
     print(f"  Total: {(n_vis + n_unet) / 1e6:.1f}M params")
 
@@ -458,7 +468,7 @@ def main():
     )
 
     # Optimizer
-    all_params = list(vision_encoder.parameters()) + list(noise_net.parameters())
+    all_params = list(vision_encoders.parameters()) + list(noise_net.parameters())
     optimizer = torch.optim.AdamW(
         all_params, lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay, betas=cfg.betas)
@@ -480,7 +490,7 @@ def main():
             is_recovery_checkpoint = os.path.basename(ckpt_path) == "recovery.pt"
             optimizer_state_restored = False
             noise_net.load_state_dict(ckpt["noise_net"])
-            vision_encoder.load_state_dict(ckpt["vision_encoder"])
+            vision_encoders.load_state_dict(ckpt["vision_encoders"])
             ema_model.averaged_model.load_state_dict(
                 ckpt.get("ema_noise_net", ckpt["noise_net"]))
             ema_model.optimization_step = ckpt.get("ema_step", ema_model.optimization_step)
@@ -567,14 +577,13 @@ def main():
     steps_done_this_run = 0
 
     for epoch in range(start_epoch, cfg.num_epochs):
-        vision_encoder.train()
+        vision_encoders.train()
         noise_net.train()
         epoch_losses = []
         epoch_start = time.time()
 
         for batch in dataloader:
             obs_state = batch["obs_state"].to(device)   # (B, To, 7)
-            obs_image = batch["obs_image"].to(device)   # (B, To, 3, H, W)
             action = batch["action"].to(device)          # (B, Tp, 7)
             B = obs_state.shape[0]
             To = cfg.obs_horizon
@@ -584,10 +593,14 @@ def main():
             action_n = action_norm.normalize(action)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                # Vision encoding
-                img_flat = obs_image.reshape(B * To, *obs_image.shape[2:])
-                vis_feat = vision_encoder(img_flat)         # (B*To, vis_dim)
-                vis_feat = vis_feat.reshape(B, To, -1)       # (B, To, vis_dim)
+                # Vision encoding — per camera, then concatenate
+                vis_feats = []
+                for cam in cam_names:
+                    img = batch[f"obs_img_{cam}"].to(device)  # (B, To, 3, H, W)
+                    img_flat = img.reshape(B * To, *img.shape[2:])
+                    feat = vision_encoders[cam](img_flat)      # (B*To, vis_dim)
+                    vis_feats.append(feat.reshape(B, To, -1))
+                vis_feat = torch.cat(vis_feats, dim=-1)  # (B, To, num_cams*vis_dim)
 
                 # Build global conditioning: concat vision + state, flatten
                 obs_feat = torch.cat([vis_feat, obs_state_n], dim=-1)
@@ -626,7 +639,7 @@ def main():
                 if try_save_checkpoint(
                     "recovery.pt",
                     os.path.join(cfg.output_dir, "recovery.pt"),
-                    noise_net, vision_encoder, ema_model,
+                    noise_net, vision_encoders, ema_model,
                     optimizer, lr_scheduler, state_norm, action_norm,
                     cfg, global_step, epoch, best_loss,
                     include_optimizer_state=False,
@@ -688,7 +701,7 @@ def main():
             if try_save_checkpoint(
                 "best.pt",
                 os.path.join(cfg.output_dir, "best.pt"),
-                noise_net, vision_encoder, ema_model,
+                noise_net, vision_encoders, ema_model,
                 optimizer, lr_scheduler, state_norm, action_norm,
                 cfg, global_step, epoch, candidate_best_loss,
                 include_optimizer_state=False,
@@ -714,7 +727,7 @@ def main():
             latest_saved = try_save_checkpoint(
                 "latest.pt",
                 latest_path,
-                noise_net, vision_encoder, ema_model,
+                noise_net, vision_encoders, ema_model,
                 optimizer, lr_scheduler, state_norm, action_norm,
                 cfg, global_step, epoch, best_loss,
                 include_optimizer_state=True,
@@ -734,7 +747,7 @@ def main():
                 latest_saved = try_save_checkpoint(
                     "latest.pt (weights-only fallback)",
                     latest_path,
-                    noise_net, vision_encoder, ema_model,
+                    noise_net, vision_encoders, ema_model,
                     optimizer, lr_scheduler, state_norm, action_norm,
                     cfg, global_step, epoch, best_loss,
                     include_optimizer_state=False,
@@ -760,7 +773,7 @@ def main():
             if try_save_checkpoint(
                 f"epoch_{epoch + 1:04d}.pt",
                 os.path.join(cfg.output_dir, f"epoch_{epoch + 1:04d}.pt"),
-                noise_net, vision_encoder, ema_model,
+                noise_net, vision_encoders, ema_model,
                 optimizer, lr_scheduler, state_norm, action_norm,
                 cfg, global_step, epoch, best_loss,
                 include_optimizer_state=False,

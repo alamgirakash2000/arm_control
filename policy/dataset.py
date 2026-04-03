@@ -1,160 +1,145 @@
-"""Dataset loader for our LeRobot v2.1 parquet + mp4 format."""
+"""Dataset loader for Zarr diffusion policy format with dual cameras.
+
+Zarr structure:
+    dataset.zarr/
+    ├── data/
+    │   ├── state       (N, 7)          float32
+    │   ├── action      (N, 7)          float32
+    │   ├── img_global  (N, 720, 1280, 3) uint8
+    │   ├── img_wrist   (N, 720, 1280, 3) uint8
+    │   ├── eef_pos     (N, 3)          float32
+    │   ├── eef_euler   (N, 3)          float32
+    │   └── timestamp   (N,)            float32
+    └── meta/
+        └── episode_ends (E,)           int64
+"""
 
 import json
 import os
 
 import cv2
 import numpy as np
-import pyarrow.parquet as pq
 import torch
+import zarr
 from torch.utils.data import Dataset
 
 
-def _float_tensor_from_array(array, shape):
-    return torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32)).reshape(shape)
-
-
 class PiperDataset(Dataset):
-    """Loads parquet + mp4 episodes and returns windowed observation-action pairs.
+    """Loads Zarr episodes and returns windowed observation-action pairs.
 
-    Video frames are cached to disk as .npy files and memory-mapped,
-    so RAM usage stays low regardless of dataset size.
+    Images are loaded on-the-fly from Zarr (memory-mapped + compressed),
+    keeping RAM usage low regardless of dataset size.
 
     Each sample contains:
-        obs_state:  (obs_horizon, 7) — past joint+gripper states
-        obs_image:  (obs_horizon, 3, H, W) — past camera frames
-        action:     (pred_horizon, 7) — future joint+gripper targets (abs_joint)
+        obs_state:       (obs_horizon, 7)       — past joint+gripper states
+        obs_img_global:  (obs_horizon, 3, H, W) — past global camera frames
+        obs_img_wrist:   (obs_horizon, 3, H, W) — past wrist camera frames
+        action:          (pred_horizon, 7)       — future joint+gripper targets
     """
 
     def __init__(self, dataset_dir, obs_horizon=2, pred_horizon=16,
-                 image_size=(240, 320), cam_name="cam_0"):
+                 image_size=(240, 426), camera_names=("global", "wrist")):
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
         self.image_size = image_size
+        self.camera_names = list(camera_names)
 
         dataset_dir = os.path.abspath(dataset_dir)
+        zarr_path = os.path.join(dataset_dir, "dataset.zarr")
+        self.root = zarr.open_group(zarr_path, mode="r")
+        data = self.root["data"]
+        meta = self.root["meta"]
 
         # Load metadata
-        with open(os.path.join(dataset_dir, "meta", "info.json")) as f:
-            info = json.load(f)
-        self.fps = info["fps"]
+        info_path = os.path.join(dataset_dir, "meta", "info.json")
+        if os.path.exists(info_path):
+            with open(info_path) as f:
+                info = json.load(f)
+            self.fps = info.get("fps", 20)
+        else:
+            self.fps = 20
 
-        episodes = []
-        with open(os.path.join(dataset_dir, "meta", "episodes.jsonl")) as f:
-            for line in f:
-                episodes.append(json.loads(line.strip()))
+        # Episode boundaries
+        self.episode_ends = np.array(meta["episode_ends"][:], dtype=np.int64)
+        self.num_episodes = len(self.episode_ends)
+        self.total_frames = int(self.episode_ends[-1]) if self.num_episodes > 0 else 0
 
-        # Frame cache directory (memory-mapped .npy files)
-        cache_dir = os.path.join(dataset_dir, ".frame_cache",
-                                 f"{image_size[0]}x{image_size[1]}")
-        os.makedirs(cache_dir, exist_ok=True)
+        # Zarr arrays (lazy — accessed on demand)
+        self.states = data["state"]
+        self.actions = data["action"]
+        self.img_arrays = {}
+        for cam in self.camera_names:
+            key = f"img_{cam}"
+            if key in data:
+                self.img_arrays[cam] = data[key]
 
-        # Load all episodes
-        self.states = []     # list of (ep_len, 7) numpy arrays
-        self.actions = []    # list of (ep_len, 7) numpy arrays
-        self.frame_maps = [] # list of memory-mapped (ep_len, H, W, 3) uint8 arrays
+        # Filter camera_names to only those present in data
+        self.camera_names = [c for c in self.camera_names if c in self.img_arrays]
 
-        print(f"Loading {len(episodes)} episodes from {dataset_dir}...")
-
-        for ep in episodes:
-            ep_idx = ep["episode_index"]
-
-            # Load parquet
-            pq_path = os.path.join(dataset_dir, "data", "chunk-000",
-                                   f"episode_{ep_idx:06d}.parquet")
-            table = pq.read_table(pq_path)
-            df = table.to_pandas()
-
-            states = np.array(df["observation.state"].tolist(), dtype=np.float32)
-            actions = np.array(df["action.abs_joint"].tolist(), dtype=np.float32)
-            self.states.append(states)
-            self.actions.append(actions)
-
-            # Load or cache video frames as memory-mapped numpy
-            cache_path = os.path.join(cache_dir, f"episode_{ep_idx:06d}.npy")
-            vpath = os.path.join(dataset_dir, "videos", "chunk-000",
-                                 f"observation.images.{cam_name}",
-                                 f"episode_{ep_idx:06d}.mp4")
-
-            if os.path.exists(cache_path):
-                frames_arr = np.load(cache_path, mmap_mode="r", allow_pickle=False)
-            else:
-                frames = self._load_video(vpath, len(states))
-                frames_arr = np.stack(frames)  # (T, H, W, 3) uint8
-                np.save(cache_path, frames_arr)
-                del frames, frames_arr
-                frames_arr = np.load(cache_path, mmap_mode="r", allow_pickle=False)
-
-            self.frame_maps.append(frames_arr)
-
-            if (ep_idx + 1) % 10 == 0:
-                print(f"  Loaded {ep_idx + 1}/{len(episodes)} episodes")
-
-        # Build sample index: (episode_idx, timestep) pairs
+        # Build sample index: (episode_start, episode_end, timestep)
         self.samples = []
-        for ep_idx in range(len(self.states)):
-            ep_len = len(self.states[ep_idx])
+        ep_start = 0
+        for ep_idx in range(self.num_episodes):
+            ep_end = int(self.episode_ends[ep_idx])
+            ep_len = ep_end - ep_start
             for t in range(obs_horizon - 1, ep_len - pred_horizon):
-                self.samples.append((ep_idx, t))
+                self.samples.append((ep_start, ep_end, t))
+            ep_start = ep_end
 
-        print(f"  Total: {len(self.samples)} training samples "
-              f"from {len(episodes)} episodes")
-
-    def _load_video(self, path, expected_frames):
-        """Load and resize all video frames."""
-        cap = cv2.VideoCapture(path)
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (self.image_size[1], self.image_size[0]),
-                               interpolation=cv2.INTER_AREA)
-            frames.append(frame)
-        cap.release()
-
-        # Handle frame count mismatch
-        if len(frames) != expected_frames:
-            n = min(len(frames), expected_frames)
-            frames = frames[:n]
-            if n < expected_frames:
-                frames.extend([frames[-1]] * (expected_frames - n))
-
-        return frames
+        print(f"Loaded Zarr dataset: {dataset_dir}")
+        print(f"  Episodes: {self.num_episodes}, Frames: {self.total_frames}")
+        print(f"  Cameras: {self.camera_names}")
+        print(f"  Training samples: {len(self.samples)}")
 
     def get_all_states(self):
-        """Return all states as a single (N, 7) numpy array for normalization."""
-        return np.concatenate(self.states, axis=0)
+        """Return all states as (N, 7) numpy array for normalization."""
+        return np.array(self.states[:], dtype=np.float32)
 
     def get_all_actions(self):
-        """Return all actions as a single (N, 7) numpy array for normalization."""
-        return np.concatenate(self.actions, axis=0)
+        """Return all actions as (N, 7) numpy array for normalization."""
+        return np.array(self.actions[:], dtype=np.float32)
+
+    def _load_and_resize(self, img):
+        """Resize a single BGR uint8 image to training resolution."""
+        H, W = self.image_size
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
+        return img
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        ep_idx, t = self.samples[idx]
+        ep_start, ep_end, t = self.samples[idx]
         To = self.obs_horizon
         Tp = self.pred_horizon
         H, W = self.image_size
 
-        # Observation: past To timesteps [t-To+1, ..., t]
-        obs_state = self.states[ep_idx][t - To + 1: t + 1].copy()  # (To, 7)
+        # Global indices for this sample
+        abs_t = ep_start + t
 
-        # Images: past To timesteps (from memory-mapped array)
-        obs_images = torch.empty((To, 3, H, W), dtype=torch.float32)
-        for j, i in enumerate(range(t - To + 1, t + 1)):
-            img = np.array(self.frame_maps[ep_idx][i], copy=True)  # (H, W, 3) uint8
-            img_t = torch.from_numpy(img).permute(2, 0, 1).float().div(255.0)
-            obs_images[j].copy_(img_t)
+        # Observation: past To timesteps [t-To+1 .. t]
+        obs_start = abs_t - To + 1
+        obs_end = abs_t + 1
+        obs_state = np.array(self.states[obs_start:obs_end], dtype=np.float32)
 
-        # Action: next Tp timesteps [t+1, ..., t+Tp]
-        action = self.actions[ep_idx][t: t + Tp].copy()  # (Tp, 7)
+        # Action: next Tp timesteps [t .. t+Tp-1]
+        act_start = abs_t
+        act_end = abs_t + Tp
+        action = np.array(self.actions[act_start:act_end], dtype=np.float32)
 
-        return {
-            "obs_state": _float_tensor_from_array(obs_state, (To, 7)),
-            "obs_image": obs_images,
-            "action": _float_tensor_from_array(action, (Tp, 7)),
+        # Images per camera
+        result = {
+            "obs_state": torch.from_numpy(obs_state),
+            "action": torch.from_numpy(action),
         }
+
+        for cam in self.camera_names:
+            imgs = torch.empty((To, 3, H, W), dtype=torch.float32)
+            raw_frames = self.img_arrays[cam][obs_start:obs_end]
+            for j in range(To):
+                img = self._load_and_resize(raw_frames[j])
+                imgs[j] = torch.from_numpy(img).permute(2, 0, 1).float().div_(255.0)
+            result[f"obs_img_{cam}"] = imgs
+
+        return result

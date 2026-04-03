@@ -8,12 +8,14 @@ from typing import Tuple
 class DiffusionPolicyConfig:
     # Dataset
     dataset_dir: str = "./data/pick"
-    image_size: Tuple[int, int] = (240, 320)  # half of 480x640, keeps 3:4 aspect ratio
+    image_size: Tuple[int, int] = (240, 426)  # ~half of 720x1280, keeps 16:9 aspect
+    camera_names: Tuple[str, ...] = ("global", "wrist")
 
     # Observation
     obs_horizon: int = 2
     obs_state_dim: int = 7          # j1-j6 + gripper
-    vision_feature_dim: int = 256
+    num_cameras: int = 2            # global + wrist
+    vision_feature_dim: int = 256   # per camera
 
     # Action
     pred_horizon: int = 16

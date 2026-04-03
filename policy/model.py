@@ -272,7 +272,11 @@ def _replace_bn_with_gn(module, num_groups=16):
 
 
 class VisionEncoder(nn.Module):
-    """ResNet18 backbone with SpatialSoftmax for spatial feature extraction."""
+    """ResNet18 backbone with SpatialSoftmax for spatial feature extraction.
+
+    Supports any input resolution — SpatialSoftmax dimensions are computed
+    dynamically on the first forward pass.
+    """
 
     def __init__(self, out_dim=256, freeze_bn=True):
         super().__init__()
@@ -285,9 +289,12 @@ class VisionEncoder(nn.Module):
             resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4,
         )
         # ResNet18 layer4 output: 512 channels
-        # For 240x320 input -> 8x10 feature map (preserves 3:4 aspect ratio)
-        self.spatial_softmax = SpatialSoftmax(8, 10, 512)
-        self.projection = nn.Linear(512 * 2, out_dim)
+        # SpatialSoftmax + projection are built lazily on first forward
+        self.out_dim = out_dim
+        self.spatial_softmax = None
+        self.projection = None
+        self._feat_h = None
+        self._feat_w = None
 
         # ImageNet normalization
         self.register_buffer("img_mean",
@@ -295,17 +302,26 @@ class VisionEncoder(nn.Module):
         self.register_buffer("img_std",
                              torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1))
 
+    def _init_head(self, feat_h, feat_w, device):
+        """Build SpatialSoftmax + projection once we know the feature map size."""
+        self._feat_h = feat_h
+        self._feat_w = feat_w
+        self.spatial_softmax = SpatialSoftmax(feat_h, feat_w, 512).to(device)
+        self.projection = nn.Linear(512 * 2, self.out_dim).to(device)
+
     def forward(self, images):
         """
         Args:
-            images: (B, 3, H, W) float32 in [0, 1] range (240x320)
+            images: (B, 3, H, W) float32 in [0, 1] range
         Returns:
             (B, out_dim) visual feature vector
         """
         x = (images - self.img_mean) / self.img_std
-        features = self.backbone(x)          # (B, 512, 8, 10)
+        features = self.backbone(x)           # (B, 512, fH, fW)
+        if self.spatial_softmax is None:
+            self._init_head(features.shape[2], features.shape[3], features.device)
         spatial = self.spatial_softmax(features)  # (B, 1024)
-        return self.projection(spatial)      # (B, out_dim)
+        return self.projection(spatial)       # (B, out_dim)
 
 
 # ============================================================

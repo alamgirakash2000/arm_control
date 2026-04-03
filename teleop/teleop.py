@@ -72,6 +72,13 @@ try:
 except ImportError:
     _arrow_ok = False
 
+try:
+    import zarr
+    from numcodecs import Blosc
+    _zarr_ok = True
+except ImportError:
+    _zarr_ok = False
+
 import subprocess as _sp
 
 def _say(text, wait=False):
@@ -401,14 +408,16 @@ def parse_args():
     p.add_argument("--port",           default=8765, type=int)
     p.add_argument("--host",           default="0.0.0.0")
     # Recording (on by default — use --no-record to disable)
-    p.add_argument("--record",         default="./data/tool_good", metavar="DIR",
-                   help="Dataset directory (default: ./data/tool_good)")
+    p.add_argument("--record",         default="./data/demo", metavar="DIR",
+                   help="Zarr dataset directory (default: ./data/demo)")
     p.add_argument("--no-record",      action="store_true",
                    help="Disable recording")
     p.add_argument("--rec-fps",        default=20, type=int,
                    help="Recording FPS (default: 20)")
-    p.add_argument("--cameras",        default="auto", metavar="IDS",
-                   help="Camera IDs (default: auto-detect)")
+    p.add_argument("--global-cam",     default="auto",
+                   help="Global camera device ID (default: auto-detect)")
+    p.add_argument("--wrist-cam",      default="auto",
+                   help="Wrist camera device ID (default: auto-detect)")
     p.add_argument("--task",           default="teleoperation demo",
                    help="Task description for dataset metadata")
     return p.parse_args()
@@ -643,191 +652,185 @@ class EpisodeBuffer:
         return len(self.rows)
 
 
-class DatasetWriter:
-    """Write episodes to a LeRobot v2.1 directory."""
+class ZarrDatasetWriter:
+    """Write episodes to a Zarr store for diffusion policy training.
+
+    Zarr structure:
+        dataset.zarr/
+        ├── data/
+        │   ├── state       (N, 7)          float32  — joints + gripper
+        │   ├── action      (N, 7)          float32  — abs joint targets (+1 shift)
+        │   ├── img_<cam>   (N, H, W, 3)    uint8    — per-camera frames
+        │   ├── eef_pos     (N, 3)          float32
+        │   ├── eef_euler   (N, 3)          float32
+        │   └── timestamp   (N,)            float32
+        └── meta/
+            └── episode_ends (E,)           int64
+    """
+
+    IMG_HEIGHT = 720
+    IMG_WIDTH = 1280
 
     def __init__(self, dataset_dir, fps, task, camera_names):
         self.dir = os.path.abspath(dataset_dir)
         self.fps = fps
         self.task = task
-        self.cam_names = camera_names
-        self.ep_count = 0
-        self.total_frames = 0
+        self.cam_names = list(camera_names)
 
-        os.makedirs(os.path.join(self.dir, "data", "chunk-000"), exist_ok=True)
-        os.makedirs(os.path.join(self.dir, "meta"), exist_ok=True)
-        for c in camera_names:
-            os.makedirs(os.path.join(self.dir, "videos", "chunk-000",
-                                     f"observation.images.{c}"), exist_ok=True)
-        info_path = os.path.join(self.dir, "meta", "info.json")
-        if os.path.exists(info_path):
-            with open(info_path) as f:
-                info = json.load(f)
-            self.ep_count = info.get("total_episodes", 0)
-            self.total_frames = info.get("total_frames", 0)
+        zarr_path = os.path.join(self.dir, "dataset.zarr")
+        self.root = zarr.open_group(zarr_path, mode="a")
+
+        compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
+        img_compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.SHUFFLE)
+
+        if "data" not in self.root:
+            self.root.create_group("data")
+        if "meta" not in self.root:
+            self.root.create_group("meta")
+        data = self.root["data"]
+        meta = self.root["meta"]
+
+        def _ensure(grp, name, shape, chunks, dtype, comp):
+            if name not in grp:
+                grp.create_dataset(name, shape=shape, chunks=chunks,
+                                   dtype=dtype, compressor=comp)
+
+        _ensure(data, "state",     (0, 7), (256, 7), "float32", compressor)
+        _ensure(data, "action",    (0, 7), (256, 7), "float32", compressor)
+        _ensure(data, "eef_pos",   (0, 3), (256, 3), "float32", compressor)
+        _ensure(data, "eef_euler", (0, 3), (256, 3), "float32", compressor)
+        _ensure(data, "timestamp", (0,),   (256,),   "float32", compressor)
+        for cam in self.cam_names:
+            _ensure(data, f"img_{cam}",
+                    (0, self.IMG_HEIGHT, self.IMG_WIDTH, 3),
+                    (1, self.IMG_HEIGHT, self.IMG_WIDTH, 3),
+                    "uint8", img_compressor)
+        _ensure(meta, "episode_ends", (0,), (256,), "int64", compressor)
+
+        # Recover state from existing store
+        self.ep_count = len(meta["episode_ends"])
+        self.total_frames = int(meta["episode_ends"][-1]) if self.ep_count > 0 else 0
 
     def save(self, buf):
-        if not _arrow_ok:
-            print(f"  {RED}pyarrow not installed — cannot save{RESET}")
+        if not _zarr_ok:
+            print(f"  {RED}zarr not installed — cannot save{RESET}")
             return None
-        ep = self.ep_count
         n = len(buf)
-        cols = {
-            "timestamp": [], "episode_index": [], "frame_index": [],
-            "index": [], "next.done": [], "task_index": [],
-            "observation.state": [], "observation.eef_pos": [],
-            "observation.eef_rot": [], "observation.eef_euler": [],
-            "action.abs_joint": [], "action.delta_joint": [],
-            "action.abs_eef": [], "action.delta_eef": [],
-        }
-        for i, row in enumerate(buf.rows):
-            cols["timestamp"].append(row["timestamp"])
-            cols["episode_index"].append(ep)
-            cols["frame_index"].append(i)
-            cols["index"].append(self.total_frames + i)
-            cols["next.done"].append(i == n - 1)
-            cols["task_index"].append(0)
-            # Observations: current frame
-            cols["observation.state"].append(row["obs_state"])
-            cols["observation.eef_pos"].append(row["obs_eef_pos"])
-            cols["observation.eef_rot"].append(row["obs_eef_rot"])
-            cols["observation.eef_euler"].append(row["obs_eef_euler"])
-            # Actions: shifted by +1 — action[t] = observation[t+1]
-            # This is the standard convention for imitation learning:
-            # "given state t, predict where to go next"
-            if i < n - 1:
-                nxt = buf.rows[i + 1]
-                cur_s = row["obs_state"]
-                nxt_s = nxt["obs_state"]
-                cols["action.abs_joint"].append(nxt_s)
-                cols["action.delta_joint"].append(
-                    [nxt_s[j] - cur_s[j] for j in range(7)])
-                nxt_eef = (list(nxt["obs_eef_pos"])
-                           + list(nxt["obs_eef_euler"]) + [nxt_s[6]])
-                cols["action.abs_eef"].append(nxt_eef)
-                cur_eef_p = row["obs_eef_pos"]
-                cur_eef_e = row["obs_eef_euler"]
-                nxt_eef_p = nxt["obs_eef_pos"]
-                nxt_eef_e = nxt["obs_eef_euler"]
-                cols["action.delta_eef"].append(
-                    [nxt_eef_p[j] - cur_eef_p[j] for j in range(3)]
-                    + [nxt_eef_e[j] - cur_eef_e[j] for j in range(3)]
-                    + [nxt_s[6] - cur_s[6]])
-            else:
-                # Last frame: hold position (zero delta)
-                cols["action.abs_joint"].append(row["obs_state"])
-                cols["action.delta_joint"].append([0.0] * 7)
-                cols["action.abs_eef"].append(
-                    list(row["obs_eef_pos"]) + list(row["obs_eef_euler"])
-                    + [row["obs_state"][6]])
-                cols["action.delta_eef"].append([0.0] * 7)
-        for cam in self.cam_names:
-            vp = f"videos/chunk-000/observation.images.{cam}/episode_{ep:06d}.mp4"
-            cols[f"observation.images.{cam}"] = [
-                {"path": vp, "timestamp": row["timestamp"]} for row in buf.rows
-            ]
+        if n == 0:
+            return None
 
-        arrays = {}
-        for key, vals in cols.items():
-            if key.startswith("observation.images."):
-                arrays[key] = pa.StructArray.from_arrays(
-                    [pa.array([v["path"] for v in vals], type=pa.string()),
-                     pa.array([v["timestamp"] for v in vals], type=pa.float32())],
-                    names=["path", "timestamp"])
-            elif isinstance(vals[0], list):
-                arrays[key] = pa.array(vals, type=pa.list_(pa.float32()))
-            elif isinstance(vals[0], bool):
-                arrays[key] = pa.array(vals, type=pa.bool_())
-            elif isinstance(vals[0], int):
-                arrays[key] = pa.array(vals, type=pa.int64())
-            else:
-                arrays[key] = pa.array(vals, type=pa.float32())
-        pq.write_table(pa.table(arrays),
-                        os.path.join(self.dir, "data", "chunk-000",
-                                     f"episode_{ep:06d}.parquet"))
+        ep = self.ep_count
+        data = self.root["data"]
+        meta = self.root["meta"]
 
+        # State + EEF data
+        states = np.array([r["obs_state"] for r in buf.rows], dtype=np.float32)
+        eef_pos = np.array([r["obs_eef_pos"] for r in buf.rows], dtype=np.float32)
+        eef_euler = np.array([r["obs_eef_euler"] for r in buf.rows], dtype=np.float32)
+        timestamps = np.array([r["timestamp"] for r in buf.rows], dtype=np.float32)
+
+        # Actions: absolute joint targets with +1 shift
+        actions = np.empty((n, 7), dtype=np.float32)
+        for i in range(n - 1):
+            actions[i] = buf.rows[i + 1]["obs_state"]
+        actions[n - 1] = buf.rows[n - 1]["obs_state"]  # hold position
+
+        # Append scalar arrays
+        data["state"].append(states)
+        data["action"].append(actions)
+        data["eef_pos"].append(eef_pos)
+        data["eef_euler"].append(eef_euler)
+        data["timestamp"].append(timestamps)
+
+        # Camera frames — pad/truncate to match state count
         for cam in self.cam_names:
             frames = buf.video_frames.get(cam, [])
-            if frames and _cv2_ok:
-                vpath = os.path.join(self.dir, "videos", "chunk-000",
-                                     f"observation.images.{cam}",
-                                     f"episode_{ep:06d}.mp4")
-                h, w = frames[0].shape[:2]
-                wr = cv2.VideoWriter(vpath, cv2.VideoWriter_fourcc(*'mp4v'),
-                                     self.fps, (w, h))
-                for fr in frames:
-                    wr.write(fr)
-                wr.release()
+            if len(frames) >= n:
+                img_arr = np.stack(frames[:n])
+            elif frames:
+                padded = frames + [frames[-1]] * (n - len(frames))
+                img_arr = np.stack(padded)
+            else:
+                img_arr = np.zeros((n, self.IMG_HEIGHT, self.IMG_WIDTH, 3),
+                                   dtype=np.uint8)
+            data[f"img_{cam}"].append(img_arr)
+
+        # Update episode_ends
+        new_end = self.total_frames + n
+        meta["episode_ends"].append(np.array([new_end], dtype=np.int64))
 
         self.ep_count += 1
-        self.total_frames += n
-        self._write_meta(ep, n)
+        self.total_frames = new_end
+        self._write_meta()
         return ep
 
-    def _write_meta(self, ep_idx, ep_len):
-        meta = os.path.join(self.dir, "meta")
-        features = {}
-        for name, shape, nms in [
-            ("observation.state", [7], ["j1","j2","j3","j4","j5","j6","gripper"]),
-            ("observation.eef_pos", [3], ["x","y","z"]),
-            ("observation.eef_rot", [9], ["r00","r01","r02","r10","r11","r12","r20","r21","r22"]),
-            ("observation.eef_euler", [3], ["roll","pitch","yaw"]),
-            ("action.abs_joint", [7], ["j1","j2","j3","j4","j5","j6","gripper"]),
-            ("action.delta_joint", [7], ["dj1","dj2","dj3","dj4","dj5","dj6","dgripper"]),
-            ("action.abs_eef", [7], ["x","y","z","roll","pitch","yaw","gripper"]),
-            ("action.delta_eef", [7], ["dx","dy","dz","droll","dpitch","dyaw","dgripper"]),
-        ]:
-            features[name] = {"dtype": "float32", "shape": shape, "names": nms}
-        for c in self.cam_names:
-            features[f"observation.images.{c}"] = {
-                "dtype": "video", "shape": [480, 640, 3],
-                "names": ["height","width","channel"],
-                "info": {"video.fps": self.fps, "video.codec": "mp4v"},
-            }
-        for k, dt, sh in [("episode_index","int64",[1]),("frame_index","int64",[1]),
-                           ("timestamp","float32",[1]),("index","int64",[1]),
-                           ("next.done","bool",[1]),("task_index","int64",[1])]:
-            features[k] = {"dtype": dt, "shape": sh}
+    def _write_meta(self):
         info = {
-            "codebase_version": "v2.1", "robot_type": "piper_hanging",
-            "fps": self.fps, "total_episodes": self.ep_count,
-            "total_frames": self.total_frames, "total_tasks": 1,
-            "total_videos": self.ep_count * len(self.cam_names),
-            "splits": {"train": f"0:{self.ep_count}"}, "features": features,
+            "codebase_version": "zarr_v1",
+            "robot_type": "piper_hanging",
+            "fps": self.fps,
+            "task": self.task,
+            "total_episodes": self.ep_count,
+            "total_frames": self.total_frames,
+            "cameras": self.cam_names,
+            "image_shape": [self.IMG_HEIGHT, self.IMG_WIDTH, 3],
+            "state_dim": 7,
+            "action_dim": 7,
         }
-        with open(os.path.join(meta, "info.json"), "w") as f:
+        os.makedirs(os.path.join(self.dir, "meta"), exist_ok=True)
+        with open(os.path.join(self.dir, "meta", "info.json"), "w") as f:
             json.dump(info, f, indent=2)
-        with open(os.path.join(meta, "tasks.jsonl"), "w") as f:
-            f.write(json.dumps({"task_index": 0, "task": self.task}) + "\n")
-        with open(os.path.join(meta, "episodes.jsonl"), "a") as f:
-            f.write(json.dumps({"episode_index": ep_idx, "tasks": [self.task],
-                                "length": ep_len}) + "\n")
 
 
 class CameraCapture:
-    """Manage USB cameras for recording."""
+    """Manage USB cameras for recording (named cameras at 1280x720).
 
-    def __init__(self, cam_ids):
+    Uses background threads to read frames continuously so read_all()
+    returns the latest frame without blocking on V4L2 I/O.
+    """
+
+    def __init__(self, cam_map):
+        """cam_map: dict of {name: device_id}, e.g. {"global": 0, "wrist": 2}"""
         self.caps = {}
         self.names = []
-        for cid in cam_ids:
+        self._frames = {}
+        self._locks = {}
+        self._threads = []
+        self._running = True
+        for name, cid in cam_map.items():
             cap = cv2.VideoCapture(cid)
             if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                name = f"cam_{cid}"
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 self.caps[name] = cap
                 self.names.append(name)
+                self._frames[name] = None
+                self._locks[name] = threading.Lock()
+                t = threading.Thread(target=self._grab_loop, args=(name, cap),
+                                     daemon=True)
+                t.start()
+                self._threads.append(t)
+
+    def _grab_loop(self, name, cap):
+        while self._running:
+            ret, frame = cap.read()
+            if ret:
+                with self._locks[name]:
+                    self._frames[name] = frame
 
     def read_all(self):
         out = {}
-        for name, cap in self.caps.items():
-            ret, frame = cap.read()
-            if ret:
-                out[name] = frame
+        for name in self.names:
+            with self._locks[name]:
+                f = self._frames[name]
+            if f is not None:
+                out[name] = f
         return out
 
     def release(self):
+        self._running = False
+        for t in self._threads:
+            t.join(timeout=1.0)
         for cap in self.caps.values():
             cap.release()
 
@@ -1048,32 +1051,44 @@ def main():
     rec_hand = active_hands[-1]  # use right controller for buttons (or only one)
 
     if rec_enabled:
-        if not _arrow_ok:
-            print(f"  {RED}ERROR: pyarrow required for recording. "
-                  f"pip install pyarrow{RESET}")
+        if not _zarr_ok:
+            print(f"  {RED}ERROR: zarr + numcodecs required for recording. "
+                  f"pip install zarr numcodecs{RESET}")
             sys.exit(1)
-        # Auto-detect camera: try indices 0-4, use the first one that opens
-        if args.cameras == "auto":
-            cam_ids = []
-            if _cv2_ok:
-                for test_id in range(5):
-                    cap = cv2.VideoCapture(test_id)
-                    if cap.isOpened():
-                        cam_ids.append(test_id)
-                        cap.release()
-                        break  # only one camera
+        # Build camera map: {name: device_id}
+        cam_map = {}
+        if _cv2_ok:
+            available = []
+            for test_id in range(10):
+                cap = cv2.VideoCapture(test_id)
+                if cap.isOpened():
+                    available.append(test_id)
                     cap.release()
+                else:
+                    cap.release()
+            # Assign global camera
+            if args.global_cam != "auto":
+                cam_map["global"] = int(args.global_cam)
+            elif available:
+                cam_map["global"] = available[0]
+            # Assign wrist camera
+            if args.wrist_cam != "auto":
+                cam_map["wrist"] = int(args.wrist_cam)
+            elif len(available) > 1:
+                for cid in available:
+                    if cid != cam_map.get("global"):
+                        cam_map["wrist"] = cid
+                        break
+        if _cv2_ok and cam_map:
+            rec_cameras = CameraCapture(cam_map)
+            print(f"  Cameras    : {rec_cameras.names}  "
+                  f"({', '.join(f'{n}=dev{cam_map[n]}' for n in rec_cameras.names)})")
         else:
-            cam_ids = [int(x) for x in args.cameras.split(",") if x.strip()]
-        if _cv2_ok and cam_ids:
-            rec_cameras = CameraCapture(cam_ids)
-            print(f"  Cameras    : {rec_cameras.names}")
-        else:
-            rec_cameras = CameraCapture([])
+            rec_cameras = CameraCapture({})
             if _cv2_ok:
                 print(f"  {YELLOW}No camera found — recording without video{RESET}")
-        rec_writer = DatasetWriter(args.record, args.rec_fps, args.task,
-                                   rec_cameras.names)
+        rec_writer = ZarrDatasetWriter(args.record, args.rec_fps, args.task,
+                                       rec_cameras.names)
         print(f"  Recording  : {args.record}")
         print(f"  Rec FPS    : {args.rec_fps}")
         print(f"  Task       : {args.task}")
