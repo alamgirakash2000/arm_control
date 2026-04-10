@@ -1,145 +1,106 @@
-"""Dataset loader for Zarr diffusion policy format with dual cameras.
+"""Zarr dataset for SigLIP+DINOv2 Diffusion Policy.
 
-Zarr structure:
-    dataset.zarr/
-    ├── data/
-    │   ├── state       (N, 7)          float32
-    │   ├── action      (N, 7)          float32
-    │   ├── img_global  (N, 720, 1280, 3) uint8
-    │   ├── img_wrist   (N, 720, 1280, 3) uint8
-    │   ├── eef_pos     (N, 3)          float32
-    │   ├── eef_euler   (N, 3)          float32
-    │   └── timestamp   (N,)            float32
-    └── meta/
-        └── episode_ends (E,)           int64
+Two modes:
+- Live images: returns raw images for finetuned vision encoders
+- Cached features: returns pre-computed SigLIP+DINOv2 features (frozen mode, 10x faster)
 """
-
-import json
-import os
 
 import cv2
 import numpy as np
-import torch
 import zarr
+import torch
 from torch.utils.data import Dataset
 
 
 class PiperDataset(Dataset):
-    """Loads Zarr episodes and returns windowed observation-action pairs.
+    """Loads images + state/action windows from Zarr.
 
-    Images are loaded on-the-fly from Zarr (memory-mapped + compressed),
-    keeping RAM usage low regardless of dataset size.
-
-    Each sample contains:
-        obs_state:       (obs_horizon, 7)       — past joint+gripper states
-        obs_img_global:  (obs_horizon, 3, H, W) — past global camera frames
-        obs_img_wrist:   (obs_horizon, 3, H, W) — past wrist camera frames
-        action:          (pred_horizon, 7)       — future joint+gripper targets
+    For finetuned vision: returns raw images (To, 3, 224, 224).
+    For frozen vision: returns cached features (To, proj_dim) after caching step.
     """
 
-    def __init__(self, dataset_dir, obs_horizon=2, pred_horizon=16,
-                 image_size=(240, 426), camera_names=("global", "wrist")):
+    def __init__(self, zarr_path, obs_horizon=2, pred_horizon=16, use_delta=False):
+        root = zarr.open_group(zarr_path, mode="r")
+
+        print("  Loading state/action into RAM ...", end=" ", flush=True)
+        self.state = np.array(root["data/state"][:], dtype=np.float32)
+        self.action = np.array(root["data/action"][:], dtype=np.float32)
+        episode_ends = root["meta/episode_ends"][:]
+
+        # Images stay on disk
+        self.img_global = root["data/img_global"]
+        self.img_wrist = root["data/img_wrist"]
+
+        self.delta = self.action - self.state
+        self.use_delta = use_delta
+        self.use_cached = False
+        self.cached_global = None
+        self.cached_wrist = None
+        print("done")
+
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
-        self.image_size = image_size
-        self.camera_names = list(camera_names)
 
-        dataset_dir = os.path.abspath(dataset_dir)
-        zarr_path = os.path.join(dataset_dir, "dataset.zarr")
-        self.root = zarr.open_group(zarr_path, mode="r")
-        data = self.root["data"]
-        meta = self.root["meta"]
+        self.valid_indices = []
+        starts = np.concatenate([[0], episode_ends[:-1]])
+        for ep_start, ep_end in zip(starts, episode_ends):
+            t_min = int(ep_start) + obs_horizon - 1
+            t_max = int(ep_end) - pred_horizon
+            for t in range(t_min, t_max + 1):
+                self.valid_indices.append(t)
 
-        # Load metadata
-        info_path = os.path.join(dataset_dir, "meta", "info.json")
-        if os.path.exists(info_path):
-            with open(info_path) as f:
-                info = json.load(f)
-            self.fps = info.get("fps", 20)
-        else:
-            self.fps = 20
+        print(f"  Samples: {len(self.valid_indices)}, "
+              f"action_mode={'delta' if use_delta else 'absolute'}")
 
-        # Episode boundaries
-        self.episode_ends = np.array(meta["episode_ends"][:], dtype=np.int64)
-        self.num_episodes = len(self.episode_ends)
-        self.total_frames = int(self.episode_ends[-1]) if self.num_episodes > 0 else 0
+    def set_cached_features(self, feat_global, feat_wrist):
+        """Set pre-computed vision features. Switches dataset to cached mode."""
+        self.cached_global = feat_global  # (N, proj_dim)
+        self.cached_wrist = feat_wrist
+        self.use_cached = True
+        print(f"  Dataset switched to cached mode: "
+              f"global={feat_global.shape}, wrist={feat_wrist.shape}")
 
-        # Zarr arrays (lazy — accessed on demand)
-        self.states = data["state"]
-        self.actions = data["action"]
-        self.img_arrays = {}
-        for cam in self.camera_names:
-            key = f"img_{cam}"
-            if key in data:
-                self.img_arrays[cam] = data[key]
-
-        # Filter camera_names to only those present in data
-        self.camera_names = [c for c in self.camera_names if c in self.img_arrays]
-
-        # Build sample index: (episode_start, episode_end, timestep)
-        self.samples = []
-        ep_start = 0
-        for ep_idx in range(self.num_episodes):
-            ep_end = int(self.episode_ends[ep_idx])
-            ep_len = ep_end - ep_start
-            for t in range(obs_horizon - 1, ep_len - pred_horizon):
-                self.samples.append((ep_start, ep_end, t))
-            ep_start = ep_end
-
-        print(f"Loaded Zarr dataset: {dataset_dir}")
-        print(f"  Episodes: {self.num_episodes}, Frames: {self.total_frames}")
-        print(f"  Cameras: {self.camera_names}")
-        print(f"  Training samples: {len(self.samples)}")
-
-    def get_all_states(self):
-        """Return all states as (N, 7) numpy array for normalization."""
-        return np.array(self.states[:], dtype=np.float32)
-
-    def get_all_actions(self):
-        """Return all actions as (N, 7) numpy array for normalization."""
-        return np.array(self.actions[:], dtype=np.float32)
-
-    def _load_and_resize(self, img):
-        """Resize a single BGR uint8 image to training resolution."""
-        H, W = self.image_size
+    def _load_image(self, arr, idx):
+        img = np.array(arr[idx])
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
-        return img
+        img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
+        img = img.astype(np.float32) / 255.0
+        return np.transpose(img, (2, 0, 1))
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        ep_start, ep_end, t = self.samples[idx]
+        t = self.valid_indices[idx]
         To = self.obs_horizon
         Tp = self.pred_horizon
-        H, W = self.image_size
 
-        # Global indices for this sample
-        abs_t = ep_start + t
+        obs_state = self.state[t - To + 1: t + 1]
 
-        # Observation: past To timesteps [t-To+1 .. t]
-        obs_start = abs_t - To + 1
-        obs_end = abs_t + 1
-        obs_state = np.array(self.states[obs_start:obs_end], dtype=np.float32)
+        if self.use_delta:
+            action = self.delta[t: t + Tp]
+        else:
+            action = self.action[t: t + Tp]
 
-        # Action: next Tp timesteps [t .. t+Tp-1]
-        act_start = abs_t
-        act_end = abs_t + Tp
-        action = np.array(self.actions[act_start:act_end], dtype=np.float32)
-
-        # Images per camera
-        result = {
-            "obs_state": torch.from_numpy(obs_state),
-            "action": torch.from_numpy(action),
-        }
-
-        for cam in self.camera_names:
-            imgs = torch.empty((To, 3, H, W), dtype=torch.float32)
-            raw_frames = self.img_arrays[cam][obs_start:obs_end]
-            for j in range(To):
-                img = self._load_and_resize(raw_frames[j])
-                imgs[j] = torch.from_numpy(img).permute(2, 0, 1).float().div_(255.0)
-            result[f"obs_img_{cam}"] = imgs
-
-        return result
+        if self.use_cached:
+            # Return pre-computed features (fast)
+            feat_g = self.cached_global[t - To + 1: t + 1]  # (To, proj_dim)
+            feat_w = self.cached_wrist[t - To + 1: t + 1]
+            return {
+                "obs_state": obs_state,
+                "obs_feat_global": feat_g,
+                "obs_feat_wrist": feat_w,
+                "action": action,
+            }
+        else:
+            # Return raw images (for finetuned vision)
+            imgs_global = np.stack([self._load_image(self.img_global, t - To + 1 + i)
+                                    for i in range(To)])
+            imgs_wrist = np.stack([self._load_image(self.img_wrist, t - To + 1 + i)
+                                   for i in range(To)])
+            return {
+                "obs_state": obs_state,
+                "obs_img_global": imgs_global,
+                "obs_img_wrist": imgs_wrist,
+                "action": action,
+            }

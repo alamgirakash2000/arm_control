@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Run SigLIP+DINOv2 Diffusion Policy on robot.
-
-Uses ReplayController (same as zarr_viewer) for smooth motion.
+"""Run VLA policy on robot with text instruction.
 
 Usage:
-    python policy/infer.py \
-        --checkpoint ./checkpoints/pick_fused/best.pt \
-        --can can0 --global-cam 0 --wrist-cam 2
+    python policy/infer_vla.py \
+        --checkpoint ./checkpoints/vla/best.pt \
+        --can can0 \
+        --instruction "pick the black object"
 """
 
 import argparse
@@ -25,7 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from config import Config
-from model import FusedVisionEncoder, DiffusionTransformer, EMAModel
+from model_vla import VLAVisionEncoder
+from model import ConditionalUnet1D, EMAModel
 from normalizer import MinMaxNormalizer
 from piper_core import (
     PiperHangingController, HOME_POSITION,
@@ -36,8 +36,6 @@ from diffusers import DDIMScheduler
 GRIPPER_MAX_UM = 70000
 JOINT_MARGIN = math.radians(2.0)
 
-
-# ── ReplayController — same as zarr_viewer ──────────────────────────────
 
 class ReplayController:
     def __init__(self, ctrl, hz=50):
@@ -72,7 +70,6 @@ class ReplayController:
                 pq, nq = self._prev_q, self._next_q
                 pg, ng = self._prev_grip, self._next_grip
                 tp, tn = self._t_prev, self._t_next
-
             if nq is not None:
                 if pq is not None and tn > tp:
                     alpha = min(1.0, max(0.0, (time.time() - tp) / (tn - tp)))
@@ -80,7 +77,6 @@ class ReplayController:
                     g = pg + alpha * (ng - pg)
                 else:
                     q, g = list(nq), ng
-
                 try:
                     q_c = [max(JOINT_LOWER[j] + JOINT_MARGIN,
                                min(JOINT_UPPER[j] - JOINT_MARGIN, q[j]))
@@ -96,44 +92,39 @@ class ReplayController:
                         round(max(0.0, min(1.0, g)) * GRIPPER_MAX_UM), 1000, 0x01, 0)
                 except Exception:
                     pass
-
             time.sleep(1.0 / self._hz)
 
 
-# ── Image preprocessing ─────────────────────────────────────────────────
-
 def preprocess_frame(frame):
-    """BGR uint8 → (1, 3, 224, 224) float32 in [0, 1]."""
     img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
     t = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0) / 255.0
     return t
 
 
-# ── Load policy ─────────────────────────────────────────────────────────
-
 def load_policy(ckpt_path, device):
     cfg = Config()
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    use_delta = ckpt.get("use_delta", False)
 
-    use_delta = ckpt.get("use_delta", cfg.use_delta)
+    text_proj_dim = 256
+    vla_cond_dim = cfg.obs_horizon * (cfg.num_cameras * cfg.proj_dim + text_proj_dim + cfg.obs_state_dim)
 
-    vision_enc = FusedVisionEncoder(
+    vla_enc = VLAVisionEncoder(
         ckpt.get("siglip_model", cfg.siglip_model),
         ckpt.get("dinov2_model", cfg.dinov2_model),
-        cfg.fused_dim, cfg.proj_dim).to(device)
-    vision_enc.load_state_dict(ckpt["vision_encoder"])
-    vision_enc.eval()
+        cfg.fused_dim, cfg.proj_dim, text_proj_dim,
+        freeze=ckpt.get("freeze_vision", False)).to(device)
+    vla_enc.load_state_dict(ckpt["vla_encoder"])
+    vla_enc.eval()
 
-    noise_net = DiffusionTransformer(
-        action_dim=cfg.action_dim, pred_horizon=cfg.pred_horizon,
-        hidden_dim=cfg.dit_hidden_dim, num_layers=cfg.dit_num_layers,
-        num_heads=cfg.dit_num_heads, global_cond_dim=cfg.global_cond_dim,
-        obs_cond_dim=cfg.obs_feature_dim, mlp_ratio=cfg.dit_mlp_ratio,
+    noise_net = ConditionalUnet1D(
+        input_dim=cfg.action_dim, global_cond_dim=vla_cond_dim,
+        down_dims=cfg.down_dims, diffusion_step_embed_dim=cfg.diffusion_step_embed_dim,
+        kernel_size=cfg.kernel_size, n_groups=cfg.n_groups,
+        cond_predict_scale=cfg.cond_predict_scale,
     ).to(device)
-    # Load EMA weights
-    ema_state = ckpt["ema"]["averaged_model"]
-    noise_net.load_state_dict(ema_state)
+    noise_net.load_state_dict(ckpt["ema"]["averaged_model"])
     noise_net.eval()
 
     state_norm = MinMaxNormalizer()
@@ -149,45 +140,42 @@ def load_policy(ckpt_path, device):
     scheduler.set_timesteps(cfg.num_inference_steps)
 
     return {
-        "vision_enc": vision_enc, "noise_net": noise_net,
+        "vla_enc": vla_enc, "noise_net": noise_net,
         "state_norm": state_norm, "action_norm": action_norm,
         "scheduler": scheduler, "cfg": cfg, "use_delta": use_delta,
+        "vla_cond_dim": vla_cond_dim, "text_proj_dim": text_proj_dim,
     }
 
 
-# ── Predict actions ─────────────────────────────────────────────────────
-
 @torch.no_grad()
-def predict_actions(obs_state_buf, img_g_buf, img_w_buf, policy, device):
+def predict_actions(obs_state_buf, img_g_buf, img_w_buf, text_feat,
+                    policy, device):
     cfg = policy["cfg"]
     To = cfg.obs_horizon
 
     obs_state = torch.from_numpy(
         np.stack(list(obs_state_buf))).float().unsqueeze(0).to(device)
-    img_g = torch.cat(list(img_g_buf), dim=0).unsqueeze(0).to(device)  # (1, To, 3, 224, 224)
+    img_g = torch.cat(list(img_g_buf), dim=0).unsqueeze(0).to(device)
     img_w = torch.cat(list(img_w_buf), dim=0).unsqueeze(0).to(device)
 
     obs_n = policy["state_norm"].normalize(obs_state.reshape(-1, 7)).reshape(1, To, 7)
 
-    B = 1
-    feat_g = policy["vision_enc"](img_g.reshape(-1, 3, 224, 224)).reshape(B, To, cfg.proj_dim)
-    feat_w = policy["vision_enc"](img_w.reshape(-1, 3, 224, 224)).reshape(B, To, cfg.proj_dim)
+    feat_g = policy["vla_enc"].encode_vision(img_g.reshape(-1, 3, 224, 224)).reshape(1, To, cfg.proj_dim)
+    feat_w = policy["vla_enc"].encode_vision(img_w.reshape(-1, 3, 224, 224)).reshape(1, To, cfg.proj_dim)
 
-    obs_feat = torch.cat([feat_g, feat_w, obs_n], dim=-1)  # (1, To, feat)
-    global_cond = obs_feat.reshape(1, -1)
-    obs_tokens = obs_feat  # (1, To, obs_feature_dim) for cross-attention
+    # Text feature expanded to match observation horizon
+    text_exp = text_feat.unsqueeze(1).expand(-1, To, -1)  # (1, To, text_proj_dim)
+
+    global_cond = torch.cat([feat_g, feat_w, text_exp, obs_n], dim=-1).reshape(1, -1)
 
     noisy = torch.randn((1, cfg.pred_horizon, cfg.action_dim), device=device)
     for t in policy["scheduler"].timesteps:
-        pred = policy["noise_net"](noisy, t.unsqueeze(0).to(device),
-                                   global_cond=global_cond, obs_tokens=obs_tokens)
+        pred = policy["noise_net"](noisy, t.unsqueeze(0).to(device), global_cond=global_cond)
         noisy = policy["scheduler"].step(pred, t, noisy).prev_sample
 
     actions = policy["action_norm"].unnormalize(noisy.reshape(-1, 7)).reshape(cfg.pred_horizon, 7)
     return actions.cpu().numpy()
 
-
-# ── Main ─────────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser()
@@ -196,21 +184,27 @@ def main():
     p.add_argument("--speed", type=int, default=70)
     p.add_argument("--global-cam", type=int, default=0)
     p.add_argument("--wrist-cam", type=int, default=2)
-    p.add_argument("--j3-offset", type=float, default=0.0,
-                    help="Extra J3 offset in degrees (negative = lower, e.g. -5)")
+    p.add_argument("--instruction", required=True,
+                   help="Task instruction, e.g. 'pick the black object'")
+    p.add_argument("--j3-offset", type=float, default=0.0)
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     fps = 20
 
     print("\n" + "=" * 55)
-    print("  SigLIP+DINOv2 DIFFUSION POLICY — INFERENCE")
+    print("  VLA DIFFUSION POLICY — INFERENCE")
     print("=" * 55)
+    print(f"  Instruction: \"{args.instruction}\"")
 
     policy = load_policy(args.checkpoint, device)
     cfg = policy["cfg"]
     use_delta = policy["use_delta"]
     print(f"  Action mode: {'DELTA' if use_delta else 'ABSOLUTE'}")
+
+    # Pre-compute text embedding (once — doesn't change during execution)
+    text_feat = policy["vla_enc"].encode_text([args.instruction], device)  # (1, text_proj_dim)
+    print(f"  Text encoded: {text_feat.shape}")
 
     cap_g = cv2.VideoCapture(args.global_cam)
     cap_w = cv2.VideoCapture(args.wrist_cam)
@@ -227,7 +221,6 @@ def main():
 
     commander = ReplayController(ctrl, hz=50)
 
-    # Pre-fill buffers
     obs_state_buf = deque(maxlen=cfg.obs_horizon)
     img_g_buf = deque(maxlen=cfg.obs_horizon)
     img_w_buf = deque(maxlen=cfg.obs_horizon)
@@ -243,10 +236,8 @@ def main():
     action_queue = deque()
     interval = 1.0 / fps
     step = 0
-    grip_phase = 0  # 0=waiting for open, 1=opened, 2=closed again (pick done)
-    grip_closed_count = 0
 
-    print("  Running — press Q or Ctrl+C to stop\n")
+    print(f"  Running \"{args.instruction}\" — press Q or Ctrl+C to stop\n")
 
     try:
         while True:
@@ -261,15 +252,13 @@ def main():
             if not ret_g or not ret_w:
                 continue
 
-            # Replan when queue is low
             if len(action_queue) <= 2:
                 img_g_buf.append(preprocess_frame(frame_g))
                 img_w_buf.append(preprocess_frame(frame_w))
 
-                raw = predict_actions(obs_state_buf, img_g_buf, img_w_buf, policy, device)
-
+                raw = predict_actions(obs_state_buf, img_g_buf, img_w_buf,
+                                      text_feat, policy, device)
                 if use_delta:
-                    # Accumulate deltas from current position
                     abs_actions = np.zeros_like(raw)
                     pos = np.array(current_q, dtype=np.float32)
                     for i in range(cfg.pred_horizon):
@@ -284,25 +273,12 @@ def main():
             if len(action_queue) > 0:
                 act = action_queue.popleft()
                 target_q = [float(act[j]) for j in range(6)]
-                # Apply J3 offset (negative = arm goes lower)
                 target_q[2] += math.radians(args.j3_offset)
                 target_grip = float(np.clip(act[6], 0.0, 1.0))
                 current_q[6] = target_grip
 
                 commander.set_target(target_q, target_grip, time.time() + interval)
                 step += 1
-
-                # Detect pick: closed(0) → open(1) → closed(0) again
-                if grip_phase == 0 and target_grip > 0.5:
-                    grip_phase = 1  # gripper opened
-                    grip_closed_count = 0
-                elif grip_phase == 1 and target_grip < 0.2:
-                    grip_closed_count += 1
-                    if grip_closed_count >= fps:  # closed for 1 second
-                        print(f"\n\n  Pick complete! Going home ...")
-                        break
-                elif grip_phase == 1 and target_grip >= 0.2:
-                    grip_closed_count = 0  # reset if grip opens again
 
             if step % 5 == 0:
                 q_str = " ".join(f"{math.degrees(q):+6.1f}" for q in target_q)
@@ -312,11 +288,11 @@ def main():
 
             disp_g = cv2.resize(frame_g, (640, 360))
             disp_w = cv2.resize(frame_w, (640, 360))
-            cv2.putText(disp_g, "global", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(disp_g, f"Task: {args.instruction}", (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             cv2.putText(disp_w, "wrist", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.imshow("Policy", np.hstack([disp_g, disp_w]))
+            cv2.imshow("VLA Policy", np.hstack([disp_g, disp_w]))
             if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
                 break
 
@@ -325,40 +301,33 @@ def main():
                 time.sleep(interval - elapsed)
 
     except KeyboardInterrupt:
-        # Ctrl+C: go home and relax
         print("\n\n  Stopped by user.")
         commander.stop()
-        print("  Homing ...")
         ctrl.go_home()
-        print("  Relaxing ...")
         ctrl.go_relax()
         ctrl.shutdown()
         cap_g.release()
         cap_w.release()
         cv2.destroyAllWindows()
-        print("  Done.")
         return
 
-    # Pick complete or Q pressed: lift first, then home (no relax)
+    # Normal stop: lift + home
     commander.stop()
-    print("  Lifting arm safely ...")
-    # Read current joints, raise J3 to safe height
-    cur_joints = ctrl.read_joints()
-    safe_q = list(cur_joints)
-    safe_q[2] = math.radians(-60)  # J3 to safe height (elbow up)
-    # Send lift command via direct joint control
-    safe_q_phys = list(safe_q)
-    safe_q_phys[5] += J6_PHYSICAL_OFFSET
-    jcmds = [round(v * RAD_TO_MDEG) for v in safe_q_phys]
+    print("\n  Lifting ...")
+    cur = ctrl.read_joints()
+    safe = list(cur)
+    safe[2] = math.radians(-60)
+    safe_phys = list(safe)
+    safe_phys[5] += J6_PHYSICAL_OFFSET
+    jcmds = [round(v * RAD_TO_MDEG) for v in safe_phys]
     ctrl.piper.MotionCtrl_2(0x01, 0x01, ctrl.speed, 0x00)
     ctrl.piper.JointCtrl(*jcmds)
-    time.sleep(2.0)  # wait for arm to lift
-    print("  Going home ...")
+    time.sleep(2.0)
     ctrl.go_home()
     cap_g.release()
     cap_w.release()
     cv2.destroyAllWindows()
-    print("  Ready for next pick.")
+    print("  Ready for next task.")
 
 
 if __name__ == "__main__":

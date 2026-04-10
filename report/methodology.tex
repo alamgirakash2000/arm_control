@@ -1,0 +1,380 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{xcolor}
+\usepackage{bm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+% Placeholder command
+\newcommand{\placeholder}[1]{\textcolor{red}{\textbf{[#1]}}}
+
+\title{A Unified Vision-Language-Action Framework for\\Generalizable Robotic Manipulation with Quality Inspection}
+
+\author{
+\IEEEauthorblockN{Author~1\IEEEauthorrefmark{1}, Author~2\IEEEauthorrefmark{1}, Author~3\IEEEauthorrefmark{1}, and Advisor~Name\IEEEauthorrefmark{1,2}}
+\IEEEauthorblockA{\IEEEauthorrefmark{1}Department Name, University Name, City, State, ZIP, USA}
+\IEEEauthorblockA{\IEEEauthorrefmark{2}Affiliated Lab or Center, City, State, ZIP, USA}
+}
+
+\begin{document}
+\maketitle
+
+%% =====================================================================
+\begin{abstract}
+We present a modular framework for generalizable robotic manipulation that unifies visual perception, language-conditioned reasoning, and learned visuomotor control under a single Language$\to$Perception$\to$Action paradigm. As a representative evaluation domain, we consider an industrial-style quality inspection task in which a dual-arm robot must autonomously pick objects, inspect them for defects, and sort them by quality. Our system comprises three tightly-integrated components: (i)~a VR-based teleoperation interface for collecting 6-DoF human demonstrations, (ii)~a fused SigLIP--DINOv2 vision encoder paired with a diffusion-based action policy, and (iii)~a VLM-driven inspection module. We describe the mathematical foundations of each subsystem, report preliminary training results, and present empirical findings---including the critical role of wrist-mounted cameras and the inadequacy of monocular hand-tracking for teleoperation---that inform the ongoing design of the full pipeline.
+\end{abstract}
+
+\begin{IEEEkeywords}
+robotic manipulation, diffusion policy, vision-language-action, teleoperation, quality inspection, imitation learning
+\end{IEEEkeywords}
+
+%% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Foundation models have begun to reshape robotic manipulation by providing a pathway from internet-scale knowledge to physical action. Vision-language-action (VLA) models such as RT-2~\cite{brohan2023rt2}, PaLM-E~\cite{driess2023palme}, $\pi_0$~\cite{black2024pi0}, and OpenVLA~\cite{kim2024openvla} demonstrate that a single model can map raw observations and natural-language instructions to low-level motor commands. These systems follow a layered abstraction:
+\begin{enumerate}
+    \item \textbf{Language} provides task specification and high-level reasoning;
+    \item \textbf{Perception} grounds language in the visual scene---detecting objects, understanding affordances, and identifying defects;
+    \item \textbf{Action} maps the grounded percept to a trajectory of motor commands.
+\end{enumerate}
+
+\placeholder{INSERT FIGURE: Unified Foundation Model Architecture diagram (Language $\to$ Perception $\to$ Action), showing LLM reasoning layer, VLM grounding layer, and VLA execution layer.}
+
+In this work, we instantiate this paradigm for a quality-inspection manipulation task with a dual-arm 6-DoF robot. Rather than building a single end-to-end monolith, we adopt a modular architecture in which each layer can be independently developed and evaluated. We present the current state of our system, focusing on the manipulation pipeline (teleoperation, data collection, and policy learning) while outlining the integration path for the inspection module.
+
+%% =====================================================================
+\section{System Architecture}
+\label{sec:system}
+
+\subsection{Hardware}
+The platform consists of two Agilex Piper 6-DoF robot arms, each with a parallel gripper (0--70\,mm range), mounted in an inverted (hanging) configuration. Communication is via CAN bus at up to 30\,Hz. Each arm is observed by two RGB cameras: a fixed \emph{global} camera (1280$\times$720\,px) and an end-effector-mounted \emph{wrist} camera (1280$\times$720\,px).
+
+\placeholder{INSERT FIGURE: Annotated photo of the full workcell---two hanging arms, global and wrist cameras, tool bin, inspection zone, and sorting bins.}
+
+\subsection{Robot Kinematics}
+The arm is modeled using modified Denavit-Hartenberg (DH) parameters~\cite{craig2005robotics}. The homogeneous transformation for each link~$i$ is:
+\begin{equation}
+\label{eq:dh}
+\mathbf{T}_i = \begin{bmatrix}
+c\theta_i & -s\theta_i & 0 & a_i \\
+s\theta_i c\alpha_i & c\theta_i c\alpha_i & -s\alpha_i & -s\alpha_i\, d_i \\
+s\theta_i s\alpha_i & c\theta_i s\alpha_i & c\alpha_i & c\alpha_i\, d_i \\
+0 & 0 & 0 & 1
+\end{bmatrix},
+\end{equation}
+where $\theta_i$, $d_i$, $a_i$, $\alpha_i$ are the DH parameters for joint~$i$, and $c(\cdot)$, $s(\cdot)$ denote cosine and sine, respectively. The end-effector pose in the world frame is obtained as:
+\begin{equation}
+\label{eq:fk}
+\mathbf{T}_\mathrm{ee} = \mathbf{T}_\mathrm{base}\prod_{i=1}^{6}\mathbf{T}_i(\theta_i + \theta_i^\mathrm{offset}),
+\end{equation}
+where $\mathbf{T}_\mathrm{base} = \mathrm{diag}(1, -1, -1, 1)$ accounts for the inverted mount by applying a 180$^\circ$ rotation about the $x$-axis.
+
+%% =====================================================================
+\section{Teleoperation}
+\label{sec:teleop}
+
+High-quality human demonstrations are a prerequisite for imitation learning~\cite{mandlekar2021matters}. We developed and evaluated two teleoperation approaches.
+
+\subsection{Vision-Based Teleoperation (Preliminary)}
+\label{sec:teleop_vision}
+
+We initially implemented a vision-based teleoperation system using MediaPipe Hands~\cite{zhang2020mediapipe_hands, lugaresi2019mediapipe}, which estimates 21 hand landmarks from a single RGB camera. The estimated 2D/3D landmark positions were mapped to translational end-effector commands, and finger aperture was used to control the gripper.
+
+This approach failed to produce usable demonstrations for two reasons. First, MediaPipe provides hand landmarks in a camera-relative coordinate system with limited depth accuracy; the resulting position estimates exhibited significant noise along the camera's optical axis ($z$). Second, and more critically, the system could not recover the full 6-DoF wrist \emph{orientation}. While the translation of the hand could be roughly inferred from 2D keypoints and a depth estimate, the 3$\times$3 rotation matrix $\mathbf{R}_\mathrm{wrist}$ is not directly observable from a monocular RGB image with sufficient accuracy. For tasks such as grasping elongated tools at specific angles, the orientation error made successful grasps unreliable.
+
+These limitations are consistent with prior observations in the literature~\cite{handa2020dexpilot} regarding the difficulty of monocular hand pose estimation for high-precision teleoperation. This finding motivated the adoption of VR-based teleoperation.
+
+\subsection{VR-Based Teleoperation}
+\label{sec:teleop_vr}
+
+We use a Meta Quest~3 headset via the OpenVR/SteamVR interface, following the design principles of Open-Teach~\cite{iyer2024openteach}. The system operates in a split-machine architecture: a Windows host reads 6-DoF controller poses and transmits them over HTTP to the robot controller on Ubuntu.
+
+\subsubsection{Coordinate Frame Mapping}
+
+The OpenVR tracking frame $\mathcal{F}_\mathrm{vr}$ ($x$\,=\,right, $y$\,=\,up, $-z$\,=\,forward) differs from the robot frame $\mathcal{F}_\mathrm{rob}$ ($x$\,=\,forward, $y$\,=\,right, $z$\,=\,down for the hanging mount). The mapping is defined by the permutation matrix:
+\begin{equation}
+\label{eq:P}
+\mathbf{P} = \begin{bmatrix} 0 & 0 & -1 \\ 1 & 0 & 0 \\ 0 & -1 & 0 \end{bmatrix},
+\end{equation}
+so that position deltas transform as $\Delta\mathbf{p}_\mathrm{rob} = \mathbf{P}\,\Delta\mathbf{p}_\mathrm{vr}$, and rotation deltas as:
+\begin{equation}
+\label{eq:rot_remap}
+\Delta\mathbf{R}_\mathrm{rob} = \mathbf{P}\,\Delta\mathbf{R}_\mathrm{vr}\,\mathbf{P}^\top.
+\end{equation}
+
+\subsubsection{Reference Pose Calibration}
+At the start of each session, the operator holds the controllers stationary for $T_\mathrm{ref} = 2.5$\,s. Controller poses are sampled during this interval and averaged to obtain the VR home position $\bar{\mathbf{p}}_\mathrm{vr}^{(0)}$ and orientation $\bar{\mathbf{R}}_\mathrm{vr}^{(0)}$. Position is averaged arithmetically. Orientation is averaged by computing:
+\begin{equation}
+\label{eq:rot_avg}
+\bar{\mathbf{R}} = \mathbf{U}\mathbf{V}^\top, \quad \text{where } \mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top = \mathrm{SVD}\!\left(\sum_{k=1}^{N}\mathbf{R}_k\right),
+\end{equation}
+which yields the closest rotation matrix to the element-wise mean in the Frobenius sense.
+
+\subsubsection{Real-Time Control Loop}
+At each timestep $t$, the controller provides pose $(\mathbf{p}_\mathrm{vr}^{(t)}, \mathbf{R}_\mathrm{vr}^{(t)})$. The relative motion is computed as:
+\begin{align}
+\Delta\mathbf{p}_\mathrm{vr} &= \mathbf{p}_\mathrm{vr}^{(t)} - \bar{\mathbf{p}}_\mathrm{vr}^{(0)}, \label{eq:dp} \\
+\Delta\mathbf{R}_\mathrm{vr} &= \mathbf{R}_\mathrm{vr}^{(t)} \left(\bar{\mathbf{R}}_\mathrm{vr}^{(0)}\right)^{-1}. \label{eq:dR}
+\end{align}
+
+The deltas are mapped to the robot frame via Eqs.~\eqref{eq:P}--\eqref{eq:rot_remap}, and combined with the robot's home pose to produce a Cartesian command:
+\begin{align}
+\mathbf{p}_\mathrm{cmd} &= \mathbf{p}_\mathrm{rob}^{(0)} + s_p\,\Delta\mathbf{p}_\mathrm{rob}, \label{eq:p_cmd}\\
+\mathbf{R}_\mathrm{cmd} &= \Delta\mathbf{R}_\mathrm{rob}\;\mathbf{R}_\mathrm{rob}^{(0)}, \label{eq:R_cmd}
+\end{align}
+where $s_p$ is a configurable position scale factor (default~1.0).
+
+\subsubsection{Inverse Kinematics}
+The Cartesian command $(\mathbf{p}_\mathrm{cmd},\mathbf{R}_\mathrm{cmd})$ is converted to joint angles using a damped-least-squares (DLS) solver~\cite{wampler1986manipulator}. At each iteration, the task-space error $\mathbf{e} = [\mathbf{e}_p;\;\mathbf{e}_r] \in \mathbb{R}^6$ is computed from the position residual $\mathbf{e}_p = \mathbf{p}_\mathrm{cmd} - \mathbf{p}_\mathrm{ee}$ and the orientation error:
+\begin{equation}
+\label{eq:rot_err}
+\mathbf{e}_r = \frac{\phi}{2\sin\phi}
+\begin{bmatrix}
+R_{32}^e - R_{23}^e \\ R_{13}^e - R_{31}^e \\ R_{21}^e - R_{12}^e
+\end{bmatrix}, \quad \mathbf{R}^e = \mathbf{R}_\mathrm{cmd}\,\mathbf{R}_\mathrm{ee}^\top,
+\end{equation}
+where $\phi = \arccos\!\bigl(\tfrac{\mathrm{tr}(\mathbf{R}^e)-1}{2}\bigr)$ is the rotation angle. The joint update is:
+\begin{equation}
+\label{eq:dls}
+\Delta\mathbf{q} = \mathbf{J}^\top\!\left(\mathbf{J}\mathbf{J}^\top + \lambda^2\mathbf{I}\right)^{-1}\mathbf{e},
+\end{equation}
+with $\lambda = 0.05$ and $\mathbf{J} \in \mathbb{R}^{6\times 6}$ the geometric Jacobian.
+
+\subsubsection{Smoothing and Safety}
+
+Three mechanisms ensure smooth and safe robot motion during teleoperation:
+\begin{itemize}
+    \item \textbf{Exponential moving average (EMA):} Each Cartesian axis is smoothed with coefficient $\alpha = 0.15$:
+    \begin{equation}
+    \hat{x}_t = \alpha\, x_t + (1-\alpha)\,\hat{x}_{t-1}.
+    \end{equation}
+    \item \textbf{Deadband:} Translational deltas smaller than 0.3\,cm and rotational deltas below 0.5$^\circ$ are suppressed.
+    \item \textbf{Velocity capping:} Maximum per-step displacement is limited to 2.5\,cm (translation) and 5.0$^\circ$ (rotation).
+\end{itemize}
+
+\placeholder{INSERT FIGURE: (a)~Operator with Quest~3 headset and controllers. (b)~Robot arm following teleoperated commands in real time. (c)~Block diagram of the teleoperation data flow: VR Sender $\to$ HTTP Relay $\to$ Robot Controller.}
+
+%% =====================================================================
+\section{Data Collection Pipeline}
+\label{sec:data}
+
+\subsection{Recording Format}
+During teleoperation, the system records synchronized streams at 20\,Hz. Each timestep captures:
+\begin{itemize}
+    \item Joint state $\mathbf{q} = [q_1, \ldots, q_6, g]^\top \in \mathbb{R}^7$ (6~joints + normalized gripper);
+    \item End-effector pose: position $\mathbf{p}_\mathrm{ee} \in \mathbb{R}^3$ and Euler angles $(\phi, \theta, \psi) \in \mathbb{R}^3$;
+    \item RGB images $\mathbf{I}_\mathrm{global}, \mathbf{I}_\mathrm{wrist} \in \mathbb{R}^{720 \times 1280 \times 3}$.
+\end{itemize}
+
+Data is stored in the Zarr format~\cite{miles2024zarr}, which provides chunked, Zstandard-compressed, memory-mapped access. Numerical arrays (state, action, end-effector) use a chunk size of 256 along the time axis; images are stored one frame per chunk with Blosc compression. The action at timestep $t$ is defined as the next-step observation:
+\begin{equation}
+\label{eq:action_def}
+\mathbf{a}_t = \mathbf{q}_{t+1},
+\end{equation}
+with the final timestep holding the terminal state.
+
+\subsection{Episode Partitioning}
+The full inspection sequence consists of three sub-tasks: \emph{pick}, \emph{inspect}, and \emph{place}. Rather than training a monolithic policy over the entire trajectory, we segment each demonstration at sub-task boundaries using an interactive annotation tool. This decomposition yields shorter-horizon training data, reducing the policy's required prediction complexity and enabling independent evaluation of each skill.
+
+\placeholder{INSERT TABLE: Dataset summary. Columns: Sub-task, Episodes, Total Frames, Avg.\ Duration~(s). Rows: Pick, Inspect, Place~(good), Place~(bad), Total.}
+
+\placeholder{INSERT FIGURE: Sample frames from the dataset. Top row: global camera views during pick, inspect, and place. Bottom row: corresponding wrist camera views.}
+
+%% =====================================================================
+\section{Policy Architecture}
+\label{sec:policy}
+
+We formulate visuomotor control as a conditional denoising diffusion process following Diffusion Policy~\cite{chi2023diffusion}. The architecture consists of a fused vision encoder and a temporal denoising network.
+
+\subsection{Fused Vision Encoder}
+\label{sec:vision}
+
+We employ two complementary pre-trained vision transformers to encode each camera image $\mathbf{I} \in \mathbb{R}^{224\times 224\times 3}$:
+\begin{itemize}
+    \item \textbf{SigLIP}~\cite{zhai2023siglip} (ViT-B/16, 86M parameters): trained on image--text pairs with a sigmoid loss, providing \emph{semantic} features (object identity, category);
+    \item \textbf{DINOv2}~\cite{oquab2024dinov2} (ViT-B/14, 86M parameters): trained on 142M images with self-supervised distillation, providing \emph{spatial} features (geometry, depth cues, relative layout).
+\end{itemize}
+
+Each encoder produces a 768-dimensional CLS token. These are concatenated and projected through a two-layer MLP:
+\begin{equation}
+\label{eq:vision}
+\mathbf{f} = W_2\;\mathrm{GELU}\!\left(W_1\,[\mathbf{f}_\mathrm{SigLIP};\;\mathbf{f}_\mathrm{DINOv2}]\right) \in \mathbb{R}^{512},
+\end{equation}
+where $W_1 \in \mathbb{R}^{768\times 1536}$, $W_2 \in \mathbb{R}^{512\times 768}$. This fusion is applied independently to each camera. The per-timestep observation vector is:
+\begin{equation}
+\label{eq:obs}
+\mathbf{o}_t = [\mathbf{f}_t^\mathrm{global};\;\mathbf{f}_t^\mathrm{wrist};\;\mathbf{q}_t] \in \mathbb{R}^{1031},
+\end{equation}
+and the global conditioning for the denoising network concatenates $T_o = 2$ observation timesteps:
+\begin{equation}
+\label{eq:cond}
+\mathbf{c} = [\mathbf{o}_{t-1};\;\mathbf{o}_t] \in \mathbb{R}^{2062}.
+\end{equation}
+
+Both vision encoders may be fine-tuned (with a reduced learning rate $\eta_v = 10^{-5}$) or frozen. Freezing permits pre-computation of features and larger batch sizes, at the cost of reduced task adaptation.
+
+\subsection{Diffusion Action Policy}
+\label{sec:diffusion}
+
+\subsubsection{Forward Process}
+Following the DDPM formulation~\cite{ho2020ddpm}, a clean action sequence $\mathbf{A}_0 = [\mathbf{a}_t, \ldots, \mathbf{a}_{t+T_p-1}] \in \mathbb{R}^{T_p \times d_a}$ is progressively corrupted by Gaussian noise over $K = 100$ timesteps:
+\begin{equation}
+\label{eq:forward}
+q(\mathbf{A}_k \mid \mathbf{A}_{k-1}) = \mathcal{N}\!\left(\mathbf{A}_k;\;\sqrt{1-\beta_k}\,\mathbf{A}_{k-1},\;\beta_k\mathbf{I}\right),
+\end{equation}
+with a squared-cosine schedule for $\beta_k$~\cite{chi2023diffusion}. Equivalently, $\mathbf{A}_k = \sqrt{\bar\alpha_k}\,\mathbf{A}_0 + \sqrt{1-\bar\alpha_k}\,\boldsymbol\epsilon$, where $\boldsymbol\epsilon \sim \mathcal{N}(\mathbf{0},\mathbf{I})$ and $\bar\alpha_k = \prod_{j=1}^k (1-\beta_j)$.
+
+\subsubsection{Noise Prediction Network}
+A conditional 1D U-Net $\epsilon_\theta$ with FiLM conditioning~\cite{chi2023diffusion} predicts the noise $\boldsymbol\epsilon$ given the noisy action sequence, diffusion timestep $k$, and observation conditioning~$\mathbf{c}$. The diffusion timestep is encoded via sinusoidal positional embedding:
+\begin{equation}
+\label{eq:temb}
+\gamma(k) = \left[\sin\!\left(\tfrac{k}{10000^{2i/d}}\right), \cos\!\left(\tfrac{k}{10000^{2i/d}}\right)\right]_{i=0}^{d/2-1},
+\end{equation}
+and processed through a two-layer MLP to produce a 256-dim embedding, which is concatenated with $\mathbf{c}$ to form the global conditioning vector. The U-Net processes the action sequence (treated as a 1D temporal signal) through an encoder--decoder with skip connections. Each residual block uses FiLM: the conditioning vector is projected to produce scale and bias parameters $(\gamma, \beta)$ that modulate the block's hidden activations:
+\begin{equation}
+\label{eq:film}
+\mathbf{h} \leftarrow \gamma \odot \mathbf{h} + \beta.
+\end{equation}
+The U-Net down-path dimensions are $(256, 512, 1024)$ with temporal kernel size~5 and GroupNorm ($n_g = 8$).
+
+\subsubsection{Training Objective}
+The network is trained to minimize the mean-squared error between predicted and actual noise:
+\begin{equation}
+\label{eq:loss}
+\mathcal{L} = \mathbb{E}_{\mathbf{A}_0,\boldsymbol\epsilon,k}\left[\left\|\boldsymbol\epsilon - \epsilon_\theta(\mathbf{A}_k, k, \mathbf{c})\right\|^2\right].
+\end{equation}
+
+\subsubsection{Inference via DDIM}
+At test time, we use DDIM~\cite{song2020ddim} with 10 denoising steps (reduced from 100 training steps) for real-time performance. Starting from $\mathbf{A}_K \sim \mathcal{N}(\mathbf{0},\mathbf{I})$, each DDIM step computes:
+\begin{equation}
+\label{eq:ddim}
+\mathbf{A}_{k-1} = \sqrt{\bar\alpha_{k-1}}\,\hat{\mathbf{A}}_0 + \sqrt{1-\bar\alpha_{k-1}}\,\epsilon_\theta(\mathbf{A}_k, k, \mathbf{c}),
+\end{equation}
+where $\hat{\mathbf{A}}_0 = \frac{1}{\sqrt{\bar\alpha_k}}\left(\mathbf{A}_k - \sqrt{1-\bar\alpha_k}\,\epsilon_\theta(\mathbf{A}_k, k, \mathbf{c})\right)$.
+
+\subsubsection{Action Chunking}
+Of the $T_p = 16$ predicted action steps, only $T_a = 8$ are executed. The robot then re-observes and re-plans, providing closed-loop correction. This receding-horizon scheme balances long-term trajectory coherence with reactivity to visual feedback.
+
+\subsection{Normalization}
+All state and action dimensions are normalized to $[-1, 1]$ via per-dimension min-max scaling computed from the training set:
+\begin{equation}
+\label{eq:norm}
+\tilde{x}_i = \frac{2(x_i - x_i^\mathrm{min})}{x_i^\mathrm{max} - x_i^\mathrm{min}} - 1.
+\end{equation}
+
+\subsection{Execution}
+At inference, the policy runs at 20\,Hz. Predicted joint targets are dispatched to a \texttt{ReplayController} thread running at 50\,Hz that linearly interpolates between consecutive targets, yielding physically smooth motion. An EMA model (power decay $\rho = 0.75$) of the U-Net weights is maintained during training and used at inference.
+
+\begin{table}[t]
+\centering
+\caption{Policy hyperparameters.}
+\label{tab:hyperparams}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Vision encoders        & SigLIP-B/16 + DINOv2-B/14 \\
+Projection dim         & 512 per camera \\
+Obs.\ horizon $T_o$   & 2 \\
+Pred.\ horizon $T_p$  & 16 \\
+Action horizon $T_a$   & 8 \\
+Action dim $d_a$       & 7 (6 joints + gripper) \\
+U-Net dims             & (256, 512, 1024) \\
+Diffusion steps (train/infer) & 100 / 10 \\
+Optimizer              & AdamW ($\beta_1\!=\!0.95$, $\beta_2\!=\!0.999$) \\
+Learning rate (U-Net)  & $10^{-4}$ \\
+Learning rate (vision) & $10^{-5}$ \\
+LR schedule            & Cosine annealing \\
+Batch size             & 8 (finetuned) / 64 (frozen) \\
+Gradient clipping      & 1.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% =====================================================================
+\section{Visual Inspection and Classification}
+\label{sec:inspection}
+
+The inspection module is responsible for analyzing the grasped object once it is presented to the inspection camera, classifying it as acceptable or defective, and communicating the decision to the manipulation planner for sorting.
+
+\placeholder{This section is under development by a collaborating team member. The following items are needed to complete it:
+\begin{enumerate}
+    \item \textbf{Inspection model}: Architecture, backbone (e.g., VLM, fine-tuned classifier), input resolution, and inference latency.
+    \item \textbf{Defect taxonomy}: Types of defects detected (scratches, discoloration, deformation, etc.).
+    \item \textbf{Dataset}: Number of labeled images, class distribution (pass/fail or graded).
+    \item \textbf{Metrics}: Classification accuracy, precision, recall, F1-score, and confusion matrix.
+    \item \textbf{Integration API}: How the binary classification output triggers the place-good vs.\ place-bad policy.
+    \item \textbf{Figures}: Example good/defective images; inspection camera setup photo.
+\end{enumerate}}
+
+%% =====================================================================
+\section{Preliminary Results and Findings}
+\label{sec:results}
+
+\subsection{Training Convergence}
+
+We trained sub-task policies (pick, inspect) using the architecture described in Sec.~\ref{sec:policy}. The training loss $\mathcal{L}$ (Eq.~\ref{eq:loss}) converges over the course of training, indicating that the model successfully learns the conditional action distribution.
+
+\placeholder{INSERT FIGURE: Training loss curves for pick and inspect policies (loss vs.\ epoch). Annotate best-loss epoch.}
+
+\placeholder{INSERT TABLE: Training summary. Columns: Sub-task, Epochs, Best Loss, Training Time. Rows: Pick, Inspect, Place.}
+
+\subsection{Importance of Wrist Camera}
+
+In our initial experiments, we trained the diffusion policy using only the global camera ($\mathbf{o}_t = [\mathbf{f}_t^\mathrm{global};\;\mathbf{q}_t]$, conditioning dimension 1031). The policy learned coarse reaching motions but consistently failed at the final grasp. The global camera, positioned at a fixed overhead location, cannot resolve the fine-grained spatial relationship between the gripper fingers and the target object---this information is either occluded by the arm or below the effective resolution at the camera's standoff distance.
+
+Adding the wrist camera ($\mathbf{o}_t = [\mathbf{f}_t^\mathrm{global};\;\mathbf{f}_t^\mathrm{wrist};\;\mathbf{q}_t]$, conditioning dimension 2062) provided the ego-centric close-up view necessary for precise grasp alignment. This finding is consistent with prior work showing that wrist cameras are critical for contact-rich manipulation~\cite{chi2023diffusion, zhao2023act}.
+
+\placeholder{INSERT FIGURE: Side-by-side comparison. Left: global-only policy reaches toward the object but misaligns the grasp. Right: global+wrist policy successfully grasps. Show representative rollout frames.}
+
+\subsection{Vision-Based vs.\ VR Teleoperation}
+As discussed in Sec.~\ref{sec:teleop_vision}, the MediaPipe-based teleoperation system was unable to produce usable demonstrations due to the absence of reliable 6-DoF orientation tracking. Table~\ref{tab:teleop_comparison} summarizes the comparison.
+
+\begin{table}[t]
+\centering
+\caption{Teleoperation method comparison.}
+\label{tab:teleop_comparison}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Property} & \textbf{MediaPipe} & \textbf{VR (Quest~3)} \\
+\midrule
+Position tracking  & 3-DoF (noisy depth) & 3-DoF (sub-mm) \\
+Orientation tracking & None reliable & Full 3-DoF \\
+Requires hardware & Camera only & VR headset \\
+Demo success rate  & \placeholder{X\%} & \placeholder{Y\%} \\
+Avg.\ demo time   & \placeholder{--} & \placeholder{Z\,s} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\placeholder{INSERT TABLE: Teleoperation quantitative metrics. Include: task completion rate (\%), avg.\ completion time (s), end-effector RMSE (mm), number of successful demonstrations, operator learning curve data.}
+
+%% =====================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\textbf{Findings.} Our experiments yield three key observations: (1)~Wrist-mounted cameras are essential for contact-rich manipulation; the ego-centric viewpoint provides geometric information that is lost in a fixed global view. (2)~Monocular hand-tracking (MediaPipe) is insufficient for 6-DoF teleoperation; the lack of reliable orientation estimation renders it impractical for grasping tasks. (3)~Sub-task decomposition simplifies policy learning by reducing the prediction horizon required for each skill.
+
+\textbf{Limitations.} The current system has been evaluated on a limited set of objects. The inspection module is not yet integrated into the closed-loop pipeline. Policy generalization to novel objects and workspaces remains to be demonstrated.
+
+\textbf{Future work.} We plan to (1)~integrate the VLM-based inspection module to close the perception--action loop; (2)~explore pre-trained VLA models~\cite{kim2024openvla, black2024pi0} as initialization for the action policy to reduce data requirements; and (3)~extend the framework to the full dual-arm sorting task.
+
+%% =====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented the methodology for a modular robotic manipulation framework following the Language$\to$Perception$\to$Action paradigm. The system combines VR-based teleoperation for demonstration collection, a fused SigLIP--DINOv2 vision encoder for multi-modal visual understanding, and a diffusion-based visuomotor policy for action generation. Preliminary experiments on a quality-inspection task validate the architecture and reveal the critical importance of wrist cameras and reliable 6-DoF teleoperation for learning contact-rich manipulation skills.
+
+\section*{Acknowledgements}
+\placeholder{INSERT: Funding, lab, advisor acknowledgements.}
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

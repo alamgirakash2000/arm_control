@@ -5,9 +5,13 @@ Remote Teleop 6DOF — Piper Hanging Arms (single or dual)
 Full 6-DOF control: position (X, Y, Z) AND orientation (roll, pitch, yaw).
 
 Supports single-arm mode:
-    python teleop.py --with_robot --left can0          # left arm only
-    python teleop.py --with_robot --right can1         # right arm only
-    python teleop.py --with_robot --left can0 --right can1  # both
+    sudo tailscale up
+    python teleop/teleop.py --with_robot --left can0 --record ./data/demo
+
+# Windows
+python teleop/vr_sender.py --server http://100.78.32.79:8765
+
+
 
 Coordinate frame mapping (OpenVR → Robot hanging upside-down):
     Robot X = −VR Z   (VR forward → robot forward)
@@ -98,14 +102,14 @@ def _say(text, wait=False):
 DEFAULT_SCALE      = 1.0
 DEFAULT_ROT_SCALE  = 1.0
 DEFAULT_SPEED      = 70
-DEFAULT_SMOOTHING  = 0.08     # lower = smoother (was 0.15)
-GRIPPER_MAX_MM     = 70.0
+DEFAULT_SMOOTHING  = 0.15     # balanced responsiveness
+GRIPPER_MAX_MM     = 90.0
 GRIPPER_DEADBAND   = 2.0      # %
-DEADBAND_CM        = 0.5      # cm — per-axis EMA deadband (was 0.3)
-MOVE_THRESH_CM     = 0.25     # cm — per-axis position threshold (was 0.15)
-ROT_THRESH_DEG     = 1.0      # deg — rotation threshold (was 0.5)
-MAX_POS_STEP_CM    = 1.0      # cm — max position change per update (velocity cap)
-MAX_ROT_STEP_DEG   = 2.5      # deg — max rotation change per update (velocity cap)
+DEADBAND_CM        = 0.3      # cm — per-axis EMA deadband (was 0.5)
+MOVE_THRESH_CM     = 0.15     # cm — per-axis position threshold (was 0.25)
+ROT_THRESH_DEG     = 0.5      # deg — rotation threshold (was 1.0)
+MAX_POS_STEP_CM    = 2.5      # cm — max position change per update (was 1.0)
+MAX_ROT_STEP_DEG   = 5.0      # deg — max rotation change per update (was 2.5)
 UPDATE_INTERVAL    = 0.025    # seconds between accepting new targets (40 Hz)
 HOLD_HZ            = 30       # Hz — rate to resend current target
 DISPLAY_HZ         = 10        # terminal print rate
@@ -120,7 +124,7 @@ IK_JOINT_MARGINS    = [math.radians(d) for d in [10.0, 10.0, 10.0, 10.0, 15.0, 1
 
 # IK joint-space smoothing: per-joint EMA rate (0=frozen, 1=instant)
 # J4 (forearm twist) tracks slower to prevent slamming into limits
-IK_JOINT_ALPHA   = [0.08, 0.08, 0.08, 0.06, 0.06, 0.08]  # J4+J5 track slower (was 0.08)
+IK_JOINT_ALPHA   = [0.15, 0.15, 0.15, 0.10, 0.10, 0.15]  # balanced
 # IK joint weights: higher = joint moves less (penalizes J4+J5 to prevent limit-hitting)
 IK_JOINT_WEIGHTS = [1.0, 1.0, 1.0, 4.0, 4.0, 1.0]        # J4+J5: 4x penalty (was 2x/1x)
 
@@ -802,6 +806,7 @@ class CameraCapture:
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)   # auto exposure
                 self.caps[name] = cap
                 self.names.append(name)
                 self._frames[name] = None
@@ -1299,9 +1304,7 @@ def main():
                         R_delta_w = T_BASE_ROT @ com_R[hand] @ T_BASE_ROT
                         R_w = R_delta_w @ ik_home_R_w
                         q_sol = ik_solve(last_ik_q[hand], pos_w, R_w,
-                                         max_iter=50, pos_tol=1e-3, rot_tol=0.02,
-                                         joint_margins=IK_JOINT_MARGINS,
-                                         joint_weights=IK_JOINT_WEIGHTS)
+                                         max_iter=50, pos_tol=1e-3, rot_tol=0.02)
                         if q_sol is not None:
                             last_ik_q[hand] = list(q_sol)
                             for i in range(6):
@@ -1338,16 +1341,29 @@ def main():
 
                 if _cv2_ok:
                     cv2.imshow("Remote Teleop 6DOF", render_frame())
-                    # Show live camera feed
+                    # Show live camera feed (side-by-side in one window)
                     if rec_cameras and rec_cameras.caps:
                         cam_frames = rec_cameras.read_all()
-                        for cname, cframe in cam_frames.items():
-                            label = "REC" if rec_state == REC_RECORDING else "LIVE"
-                            color = (0, 0, 255) if rec_state == REC_RECORDING else (0, 255, 0)
-                            cv2.putText(cframe, f"{label} {cname}",
-                                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.7, color, 2)
-                            cv2.imshow(cname, cframe)
+                        label = "REC" if rec_state == REC_RECORDING else "LIVE"
+                        color = (0, 0, 255) if rec_state == REC_RECORDING else (0, 255, 0)
+                        panels = []
+                        for cname in rec_cameras.names:
+                            if cname in cam_frames:
+                                f = cam_frames[cname]
+                                cv2.putText(f, f"{label} {cname}",
+                                            (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.7, color, 2)
+                                panels.append(f)
+                        if panels:
+                            # Resize to same height, then stack horizontally
+                            h = min(p.shape[0] for p in panels)
+                            resized = []
+                            for p in panels:
+                                if p.shape[0] != h:
+                                    w = int(p.shape[1] * h / p.shape[0])
+                                    p = cv2.resize(p, (w, h))
+                                resized.append(p)
+                            cv2.imshow("Cameras", np.hstack(resized))
                     cv2.waitKey(1)
 
             # ── Recording status on terminal ───────────────────────────────

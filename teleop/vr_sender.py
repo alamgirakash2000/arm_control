@@ -24,12 +24,34 @@ The script sends JSON frames like:
 """
 
 import argparse
-import json
 import sys
 import time
 import threading
-import urllib.request
-import urllib.error
+try:
+    import requests
+except ImportError:
+    import subprocess
+    print("  requests not found — installing ...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
+
+# Disable SSL warnings for ngrok free-tier
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Persistent session with automatic retry on connection drops
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_retry = Retry(total=3, backoff_factor=0.05,
+               status_forcelist=[502, 503, 504],
+               allowed_methods=["POST", "GET"])
+_adapter = HTTPAdapter(max_retries=_retry, pool_maxsize=1)
+_session = requests.Session()
+_session.verify = False
+_session.headers.update({"Content-Type": "application/json"})
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
 
 # Auto-install openvr if missing
 try:
@@ -159,12 +181,7 @@ class AsyncSender:
                 self._payload = None
 
             try:
-                data = json.dumps(payload).encode()
-                req = urllib.request.Request(
-                    self._url, data=data,
-                    headers={"Content-Type": "application/json"},
-                )
-                urllib.request.urlopen(req, timeout=self._timeout)
+                _session.post(self._url, json=payload, timeout=self._timeout)
                 self._sent += 1
                 self._errors = 0
             except Exception as e:
@@ -210,8 +227,8 @@ Examples:
     print("  Testing server connection ...", end=" ", flush=True)
     try:
         status_url = args.server.rstrip("/") + "/status"
-        resp = urllib.request.urlopen(status_url, timeout=5)
-        print(f"OK ({resp.status})")
+        resp = _session.get(status_url, timeout=5)
+        print(f"OK ({resp.status_code})")
     except Exception as e:
         print(f"WARNING: {e}")
         print("  Will keep trying — make sure the server is running.")

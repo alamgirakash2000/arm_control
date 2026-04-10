@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Train SigLIP + DINOv2 fused Diffusion Policy.
+"""Train VLA: SigLIP(vision+text) + DINOv2 + Diffusion Policy.
 
-Both vision encoders are finetuned (lower LR) alongside the DiT.
+Same as train.py but with text conditioning from SigLIP text encoder.
 
 Usage:
-    python policy/train.py \
-        --dataset_dir ./data/split/pick_trimmed \
-        --output_dir ./checkpoints/pick_fused \
+    python policy/train_vla.py \
+        --dataset_dir ./data/vla_dataset \
+        --output_dir ./checkpoints/vla \
         --epochs 500
 
-    # Resume
-    python policy/train.py \
-        --dataset_dir ./data/split/pick_trimmed \
-        --output_dir ./checkpoints/pick_fused \
-        --resume latest --epochs 500
+    # With frozen vision (fast)
+    python policy/train_vla.py \
+        --dataset_dir ./data/vla_dataset \
+        --output_dir ./checkpoints/vla_frozen \
+        --freeze_vision --epochs 3000
 """
 
 import argparse
@@ -22,7 +22,6 @@ import os
 import sys
 import time
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -32,21 +31,20 @@ from diffusers import DDPMScheduler
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import Config
-from dataset import PiperDataset
-from model import FusedVisionEncoder, DiffusionTransformer, EMAModel
+from dataset_vla import VLADataset
+from model_vla import VLAVisionEncoder
+from model import ConditionalUnet1D, EMAModel
 from normalizer import MinMaxNormalizer
 
 
-# ── Checkpoint ───────────────────────────────────────────────────────────────
-
-def save_checkpoint(path, epoch, step, best_loss, vision_enc, noise_net,
+def save_checkpoint(path, epoch, step, best_loss, vla_enc, noise_net,
                     ema, optimizer, lr_sched, state_norm, action_norm, cfg):
     tmp = path + ".tmp"
     torch.save({
         "epoch": epoch,
         "global_step": step,
         "best_loss": best_loss,
-        "vision_encoder": vision_enc.state_dict(),
+        "vla_encoder": vla_enc.state_dict(),
         "noise_net": noise_net.state_dict(),
         "ema": ema.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -57,23 +55,20 @@ def save_checkpoint(path, epoch, step, best_loss, vision_enc, noise_net,
         "siglip_model": cfg.siglip_model,
         "dinov2_model": cfg.dinov2_model,
         "freeze_vision": cfg.freeze_vision,
+        "is_vla": True,
     }, tmp)
     os.replace(tmp, path)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-
 def main():
-    parser = argparse.ArgumentParser(description="Train SigLIP+DINOv2 Diffusion Policy")
+    parser = argparse.ArgumentParser(description="Train VLA Diffusion Policy")
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--resume", default=None, help="'latest' or path")
-    parser.add_argument("--freeze_vision", action="store_true",
-                        help="Freeze SigLIP+DINOv2 (fast, batch_size=64)")
-    parser.add_argument("--delta", action="store_true",
-                        help="Train with delta actions instead of absolute")
+    parser.add_argument("--freeze_vision", action="store_true")
+    parser.add_argument("--delta", action="store_true")
+    parser.add_argument("--resume", default=None)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -81,7 +76,7 @@ def main():
     if args.freeze_vision:
         cfg.freeze_vision = True
         if not args.batch_size:
-            cfg.batch_size = 64  # much larger batch when frozen
+            cfg.batch_size = 64
     if args.delta:
         cfg.use_delta = True
     if args.batch_size:
@@ -89,9 +84,13 @@ def main():
     cfg.num_epochs = args.epochs
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
+    # VLA has text conditioning: +256 to the conditioning dim
+    text_proj_dim = 256
+    vla_cond_dim = cfg.obs_horizon * (cfg.num_cameras * cfg.proj_dim + text_proj_dim + cfg.obs_state_dim)
+
     print()
     print("=" * 60)
-    print("  SigLIP + DINOv2 FUSED DIFFUSION POLICY")
+    print("  VLA: SigLIP + DINOv2 + TEXT DIFFUSION POLICY")
     print("=" * 60)
     print(f"  Device      : {device}")
     print(f"  Dataset     : {args.dataset_dir}")
@@ -99,11 +98,20 @@ def main():
     print(f"  Batch size  : {cfg.batch_size}")
     print(f"  Action mode : {'delta' if cfg.use_delta else 'absolute'}")
     print(f"  Vision      : SigLIP + DINOv2 ({'frozen' if cfg.freeze_vision else 'finetuned'})")
+    print(f"  Text        : SigLIP text encoder (frozen)")
+    print(f"  Cond dim    : {vla_cond_dim}")
     print()
 
     # ── Dataset ──────────────────────────────────────────────────
     zarr_path = os.path.join(args.dataset_dir, "dataset.zarr")
-    dataset = PiperDataset(zarr_path, cfg.obs_horizon, cfg.pred_horizon, cfg.use_delta)
+    labels_path = os.path.join(args.dataset_dir, "meta", "task_labels.json")
+    if not os.path.exists(labels_path):
+        print(f"  ERROR: {labels_path} not found")
+        print(f"  Run partition_vla.py --export first")
+        sys.exit(1)
+
+    dataset = VLADataset(zarr_path, labels_path,
+                         cfg.obs_horizon, cfg.pred_horizon, cfg.use_delta)
     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
                             num_workers=4, pin_memory=True, persistent_workers=True)
     print(f"  Batches/ep  : {len(dataloader)}")
@@ -120,70 +128,58 @@ def main():
     if cfg.use_delta:
         all_deltas = all_actions - all_states
         action_norm.fit(all_deltas)
-        print(f"  Delta range : [{all_deltas.min():.4f}, {all_deltas.max():.4f}]")
         del all_deltas
     else:
         action_norm.fit(all_actions)
     del all_states, all_actions
 
     # ── Model ────────────────────────────────────────────────────
-    vision_enc = FusedVisionEncoder(
+    vla_enc = VLAVisionEncoder(
         cfg.siglip_model, cfg.dinov2_model,
-        cfg.fused_dim, cfg.proj_dim, freeze=cfg.freeze_vision).to(device)
-    noise_net = DiffusionTransformer(
-        action_dim=cfg.action_dim,
-        pred_horizon=cfg.pred_horizon,
-        hidden_dim=cfg.dit_hidden_dim,
-        num_layers=cfg.dit_num_layers,
-        num_heads=cfg.dit_num_heads,
-        global_cond_dim=cfg.global_cond_dim,
-        obs_cond_dim=cfg.obs_feature_dim,
-        mlp_ratio=cfg.dit_mlp_ratio,
+        cfg.fused_dim, cfg.proj_dim, text_proj_dim,
+        freeze=cfg.freeze_vision).to(device)
+
+    noise_net = ConditionalUnet1D(
+        input_dim=cfg.action_dim,
+        global_cond_dim=vla_cond_dim,
+        down_dims=cfg.down_dims,
+        diffusion_step_embed_dim=cfg.diffusion_step_embed_dim,
+        kernel_size=cfg.kernel_size,
+        n_groups=cfg.n_groups,
+        cond_predict_scale=cfg.cond_predict_scale,
     ).to(device)
     ema = EMAModel(noise_net, power=cfg.ema_power)
 
-    # Separate parameter groups
-    proj_params = list(vision_enc.projection.parameters())
-    dit_params = list(noise_net.parameters())
-    n_proj = sum(p.numel() for p in proj_params)
-    n_dit = sum(p.numel() for p in dit_params)
+    # Parameter groups
+    proj_params = list(vla_enc.vision_projection.parameters()) + \
+                  list(vla_enc.text_projection.parameters())
+    unet_params = list(noise_net.parameters())
 
     if cfg.freeze_vision:
         trainable_groups = [
             {"params": proj_params, "lr": cfg.learning_rate},
-            {"params": dit_params, "lr": cfg.learning_rate},
+            {"params": unet_params, "lr": cfg.learning_rate},
         ]
-        n_vision = sum(p.numel() for p in vision_enc.siglip.parameters()) + \
-                   sum(p.numel() for p in vision_enc.dinov2.parameters())
-        print(f"  Vision params : {n_vision:,} (FROZEN)")
-        print(f"  Proj params   : {n_proj:,} (lr={cfg.learning_rate})")
-        print(f"  DiT params  : {n_dit:,} (lr={cfg.learning_rate})")
-        print(f"  Trainable     : {n_proj + n_dit:,}")
+        n_trainable = sum(p.numel() for g in trainable_groups for p in g["params"])
+        print(f"  Trainable   : {n_trainable:,} (vision frozen)")
     else:
-        vision_params = list(vision_enc.siglip.parameters()) + \
-                        list(vision_enc.dinov2.parameters())
+        vision_params = list(vla_enc.siglip_vision.parameters()) + \
+                        list(vla_enc.dinov2.parameters())
         trainable_groups = [
             {"params": vision_params, "lr": cfg.vision_lr},
             {"params": proj_params, "lr": cfg.learning_rate},
-            {"params": dit_params, "lr": cfg.learning_rate},
+            {"params": unet_params, "lr": cfg.learning_rate},
         ]
-        n_vision = sum(p.numel() for p in vision_params)
-        print(f"  Vision params : {n_vision:,} (lr={cfg.vision_lr})")
-        print(f"  Proj params   : {n_proj:,} (lr={cfg.learning_rate})")
-        print(f"  DiT params  : {n_dit:,} (lr={cfg.learning_rate})")
-        print(f"  Total         : {n_vision + n_proj + n_dit:,}")
-    print(f"  Cond dim      : {cfg.global_cond_dim}")
+        n_trainable = sum(p.numel() for g in trainable_groups for p in g["params"])
+        print(f"  Trainable   : {n_trainable:,} (vision finetuned)")
 
     optimizer = torch.optim.AdamW(trainable_groups,
                                   weight_decay=cfg.weight_decay, betas=cfg.betas)
-
     lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg.num_epochs)
-
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=cfg.num_train_timesteps,
         beta_schedule=cfg.beta_schedule,
-        clip_sample=False,
-        prediction_type="epsilon",
+        clip_sample=False, prediction_type="epsilon",
     )
 
     # ── Resume ───────────────────────────────────────────────────
@@ -199,7 +195,7 @@ def main():
         if os.path.exists(ckpt_path):
             print(f"\n  Resuming from {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            vision_enc.load_state_dict(ckpt["vision_encoder"])
+            vla_enc.load_state_dict(ckpt["vla_encoder"])
             noise_net.load_state_dict(ckpt["noise_net"])
             ema.load_state_dict(ckpt["ema"])
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -211,50 +207,6 @@ def main():
             global_step = ckpt.get("global_step", 0)
             print(f"  Epoch {start_epoch}, step {global_step}, best {best_loss:.6f}")
 
-    # ── Cache vision features if frozen ────────────────────────────
-    if cfg.freeze_vision:
-        cache_path = os.path.join(args.dataset_dir, "fused_cache.npz")
-        if os.path.exists(cache_path):
-            print(f"\n  Loading cached features from {cache_path}")
-            cache = np.load(cache_path)
-            dataset.set_cached_features(cache["global"], cache["wrist"])
-        else:
-            print(f"\n  Caching SigLIP+DINOv2 features (one-time) ...")
-            N = dataset.state.shape[0]
-            feat_g_all = np.zeros((N, cfg.proj_dim), dtype=np.float32)
-            feat_w_all = np.zeros((N, cfg.proj_dim), dtype=np.float32)
-            batch_sz = 32
-            vision_enc.eval()
-            with torch.no_grad():
-                for start in range(0, N, batch_sz):
-                    end = min(start + batch_sz, N)
-                    # Load + preprocess images
-                    imgs_g = []
-                    imgs_w = []
-                    for i in range(start, end):
-                        imgs_g.append(dataset._load_image(dataset.img_global, i))
-                        imgs_w.append(dataset._load_image(dataset.img_wrist, i))
-                    imgs_g = torch.from_numpy(np.stack(imgs_g)).to(device)
-                    imgs_w = torch.from_numpy(np.stack(imgs_w)).to(device)
-                    feat_g_all[start:end] = vision_enc(imgs_g).cpu().numpy()
-                    feat_w_all[start:end] = vision_enc(imgs_w).cpu().numpy()
-                    if (start // batch_sz) % 20 == 0 or end == N:
-                        print(f"    {end}/{N} ({100*end/N:.0f}%)")
-            np.savez(cache_path, **{"global": feat_g_all, "wrist": feat_w_all})
-            dataset.set_cached_features(feat_g_all, feat_w_all)
-            print(f"  Cached to {cache_path}")
-
-        # Rebuild dataloader — cached mode is much smaller, more workers OK
-        dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
-                                num_workers=4, pin_memory=True, persistent_workers=True)
-        print(f"  Batches/ep  : {len(dataloader)} (cached)")
-
-    # Save config
-    config_out = {k: getattr(cfg, k) for k in dir(cfg)
-                  if not k.startswith("_") and not callable(getattr(cfg, k))}
-    with open(os.path.join(args.output_dir, "config.json"), "w") as f:
-        json.dump(config_out, f, indent=2, default=str)
-
     # ── Training ─────────────────────────────────────────────────
     print(f"\n{'─'*60}")
     print(f"  Training — {cfg.num_epochs - start_epoch} epochs remaining")
@@ -262,7 +214,7 @@ def main():
 
     for epoch in range(start_epoch, cfg.num_epochs):
         if not cfg.freeze_vision:
-            vision_enc.train()
+            vla_enc.train()
         noise_net.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -270,7 +222,10 @@ def main():
 
         for batch in dataloader:
             obs_state = batch["obs_state"].to(device)
+            img_g = batch["obs_img_global"].to(device)
+            img_w = batch["obs_img_wrist"].to(device)
             action = batch["action"].to(device)
+            texts = batch["text"]  # list of strings
 
             B, To = obs_state.shape[:2]
             Tp = cfg.pred_horizon
@@ -279,39 +234,31 @@ def main():
                 obs_n = state_norm.normalize(obs_state.reshape(-1, 7)).reshape(B, To, 7)
                 act_n = action_norm.normalize(action.reshape(-1, 7)).reshape(B, Tp, 7)
 
-                if dataset.use_cached:
-                    # Cached: features already computed, just project
-                    feat_g = batch["obs_feat_global"].to(device)  # (B, To, proj_dim)
-                    feat_w = batch["obs_feat_wrist"].to(device)
-                else:
-                    # Live: run images through vision encoder
-                    img_g = batch["obs_img_global"].to(device)
-                    img_w = batch["obs_img_wrist"].to(device)
-                    feat_g = vision_enc(img_g.reshape(-1, 3, 224, 224))
-                    feat_g = feat_g.reshape(B, To, cfg.proj_dim)
-                    feat_w = vision_enc(img_w.reshape(-1, 3, 224, 224))
-                    feat_w = feat_w.reshape(B, To, cfg.proj_dim)
+                # Vision features
+                feat_g = vla_enc.encode_vision(img_g.reshape(-1, 3, 224, 224))
+                feat_g = feat_g.reshape(B, To, cfg.proj_dim)
+                feat_w = vla_enc.encode_vision(img_w.reshape(-1, 3, 224, 224))
+                feat_w = feat_w.reshape(B, To, cfg.proj_dim)
 
-                # Observation features: (B, To, obs_feature_dim)
-                obs_feat = torch.cat([feat_g, feat_w, obs_n], dim=-1)
-                # Flattened for global conditioning (AdaLN)
+                # Text features (same for all timesteps in observation window)
+                text_feat = vla_enc.encode_text(texts, device)  # (B, text_proj_dim)
+                text_feat = text_feat.unsqueeze(1).expand(-1, To, -1)  # (B, To, text_proj_dim)
+
+                # Global conditioning: [vision_g, vision_w, text, state] × To
+                obs_feat = torch.cat([feat_g, feat_w, text_feat, obs_n], dim=-1)
                 global_cond = obs_feat.reshape(B, -1)
-                # Token sequence for cross-attention
-                obs_tokens = obs_feat  # (B, To, obs_feature_dim)
 
-                # Diffusion training step
+                # Diffusion
                 noise = torch.randn_like(act_n)
                 timesteps = torch.randint(0, cfg.num_train_timesteps, (B,), device=device).long()
                 noisy = noise_scheduler.add_noise(act_n, noise, timesteps)
-                pred = noise_net(noisy, timesteps, global_cond=global_cond,
-                                 obs_tokens=obs_tokens)
+                pred = noise_net(noisy, timesteps, global_cond=global_cond)
                 loss = F.mse_loss(pred, noise)
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                [p for group in trainable_groups for p in group["params"]],
-                cfg.grad_clip_norm)
+                [p for g in trainable_groups for p in g["params"]], cfg.grad_clip_norm)
             optimizer.step()
             ema.update(noise_net)
 
@@ -340,17 +287,16 @@ def main():
         if avg_loss < best_loss:
             best_loss = avg_loss
             save_checkpoint(os.path.join(args.output_dir, "best.pt"),
-                            epoch, global_step, best_loss, vision_enc, noise_net,
+                            epoch, global_step, best_loss, vla_enc, noise_net,
                             ema, optimizer, lr_sched, state_norm, action_norm, cfg)
 
         if (epoch + 1) % cfg.save_every_epochs == 0 or epoch == cfg.num_epochs - 1:
             save_checkpoint(os.path.join(args.output_dir, "latest.pt"),
-                            epoch, global_step, best_loss, vision_enc, noise_net,
+                            epoch, global_step, best_loss, vla_enc, noise_net,
                             ema, optimizer, lr_sched, state_norm, action_norm, cfg)
             print(f"    checkpoint saved (epoch {epoch})")
 
     print(f"\n  Training complete. Best loss: {best_loss:.6f}")
-    print(f"  Checkpoints: {args.output_dir}/")
 
 
 if __name__ == "__main__":

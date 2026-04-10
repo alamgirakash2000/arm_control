@@ -1,0 +1,269 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{xcolor}
+\usepackage{soul}
+
+% Placeholder command for missing content
+\newcommand{\placeholder}[1]{\textcolor{red}{\textbf{[#1]}}}
+
+\title{A Unified Vision-Language-Action Framework for\\Autonomous Robotic Quality Inspection}
+
+\author{
+\IEEEauthorblockN{Author 1\IEEEauthorrefmark{1}, Author 2\IEEEauthorrefmark{1}, Author 3\IEEEauthorrefmark{1}, and Advisor Name\IEEEauthorrefmark{1,2}}
+\IEEEauthorblockA{\IEEEauthorrefmark{1}Department Name\\
+University Name\\
+City, State, ZIP, USA}
+\IEEEauthorblockA{\IEEEauthorrefmark{2}Affiliated Lab or Center\\
+City, State, ZIP, USA}
+}
+
+\begin{document}
+
+\maketitle
+
+% =====================================================
+\begin{abstract}
+Robotic manipulation tasks in structured environments, such as quality inspection on assembly lines, require the integration of perception, reasoning, and dexterous action. In this paper, we present a unified framework that combines vision, language, and action to enable a dual-arm robotic system to autonomously pick, inspect, classify, and sort objects based on quality. Our approach follows the paradigm of foundation models for robotics, where language provides task-level reasoning, vision enables grounding and defect detection, and a learned visuomotor policy executes manipulation skills. We describe our complete system, including a virtual reality (VR) based teleoperation interface for collecting human demonstrations, a structured data collection pipeline, and a diffusion-based policy trained on the collected data. We report preliminary findings from early policy training experiments, discuss the limitations of single-camera and vision-based teleoperation approaches, and outline the path toward a fully integrated inspection and sorting system.
+\end{abstract}
+
+\begin{IEEEkeywords}
+robotic manipulation, quality inspection, imitation learning, diffusion policy, teleoperation, vision-language-action
+\end{IEEEkeywords}
+
+% =====================================================
+\section{Introduction}
+
+Recent advances in foundation models have opened new possibilities for robotic manipulation. Large language models (LLMs) provide task-level reasoning and planning, vision-language models (VLMs) enable open-vocabulary perception and defect understanding, and vision-language-action (VLA) models can directly map observations to robot actions \cite{brohan2023rt2, driess2023palme, black2024pi0}. The combination of these three capabilities, Language $\rightarrow$ Perception $\rightarrow$ Action, forms a unified architecture that can generalize across tasks, environments, and object categories.
+
+\placeholder{INSERT FIGURE: Unified Foundation Model Architecture diagram (LLM + VLM + VLA hierarchy). See attached slide image.}
+
+In manufacturing and healthcare settings, quality inspection of tools and components is a critical but labor-intensive process. A human operator must pick each item, visually inspect it for defects, classify it as acceptable or defective, and sort it into the appropriate bin. This repetitive task is an ideal candidate for robotic automation, yet it demands a combination of dexterous manipulation, visual understanding, and decision-making that has traditionally required separate, hand-engineered subsystems.
+
+In this work, we approach this challenge by building toward a unified framework where:
+\begin{itemize}
+    \item An \textbf{LLM} handles high-level task planning and decision-making (e.g., determining the inspection sequence and sorting logic);
+    \item A \textbf{VLM} performs visual grounding and defect classification (e.g., identifying surface defects, discoloration, or deformation); and
+    \item A \textbf{VLA policy} executes the physical manipulation (e.g., picking, repositioning for inspection, and placing into sorted bins).
+\end{itemize}
+
+Rather than training a single monolithic model, we adopt a modular approach where each component can be developed, evaluated, and improved independently. This paper focuses primarily on the action component---the visuomotor policy for manipulation---while describing the overall system design and the role of each module.
+
+Our contributions are as follows:
+\begin{enumerate}
+    \item A VR-based teleoperation system for collecting high-quality human demonstrations of manipulation tasks;
+    \item A structured data collection pipeline that captures synchronized multi-camera imagery, joint states, and end-effector poses;
+    \item Preliminary results from training a diffusion-based visuomotor policy, including findings on the importance of wrist-mounted cameras; and
+    \item An analysis of alternative teleoperation approaches and their limitations.
+\end{enumerate}
+
+% =====================================================
+\section{Related Work}
+
+\subsection{Foundation Models for Robotics}
+
+The idea of unifying language, vision, and action in a single framework has gained significant attention. RT-2 \cite{brohan2023rt2} demonstrated that a vision-language model pre-trained on internet-scale data can be fine-tuned to directly output robot actions. PaLM-E \cite{driess2023palme} showed that an embodied multimodal language model can perform planning and reasoning grounded in visual observations. More recently, $\pi_0$ \cite{black2024pi0} proposed a vision-language-action flow model for general-purpose robot control, and OpenVLA \cite{kim2024openvla} released an open-source VLA model trained on diverse manipulation datasets. These works inspire our approach of building a layered architecture where language, perception, and action are tightly integrated.
+
+\subsection{Imitation Learning and Diffusion Policy}
+
+Learning manipulation skills from human demonstrations has been a long-standing approach in robotics \cite{mandlekar2021matters}. Recent work has shown that diffusion models, originally developed for image generation \cite{ho2020ddpm}, can be effectively applied to action generation. Diffusion Policy \cite{chi2023diffusion} demonstrated that modeling the action distribution as a denoising diffusion process leads to policies that capture multi-modal behaviors and achieve strong performance on contact-rich manipulation tasks. RDT-1B \cite{liu2024rdt} extended this idea to bimanual manipulation at scale. We adopt the diffusion policy framework for our visuomotor policy.
+
+\subsection{Teleoperation for Data Collection}
+
+High-quality demonstration data is essential for imitation learning. ACT \cite{zhao2023act} used low-cost leader-follower arms to collect bimanual demonstrations. Open-Teach \cite{iyer2024openteach} developed a versatile teleoperation system using VR controllers for diverse manipulation tasks. Vision-based teleoperation approaches \cite{handa2020dexpilot} have also been explored, where hand tracking from cameras is used to control the robot. Our system builds on the VR-based approach due to its ability to capture full 6-DoF control inputs.
+
+% =====================================================
+\section{System Overview}
+
+Our system is designed around a dual-arm robotic workcell that performs the complete inspection pipeline: picking a tool from an unstructured bin, presenting it to an inspection station, classifying it, and placing it into the appropriate sorted bin. The system consists of three main components, described in the following subsections.
+
+\placeholder{INSERT FIGURE: Photo or diagram of the full system setup showing the two robot arms, cameras, tool bin, and sorting bins.}
+
+\subsection{Hardware Setup}
+
+The manipulation platform consists of two 6-DoF robot arms (Agilex Piper), each equipped with a parallel gripper. The arms are mounted in an inverted (hanging) configuration from an overhead frame, which provides a large and unobstructed workspace below. Communication with the arms is achieved over a CAN bus interface, allowing direct joint-level and Cartesian-level control at up to 30\,Hz.
+
+The perception system includes two cameras per arm:
+\begin{itemize}
+    \item A \textbf{global camera} mounted at a fixed location overlooking the workspace, providing a broad view of the scene; and
+    \item A \textbf{wrist camera} mounted on the end-effector of the robot, providing a close-up, ego-centric view of the object being manipulated.
+\end{itemize}
+
+Both cameras capture RGB images at a resolution of 1280$\times$720 pixels. For policy training, the images are resized to 426$\times$240 pixels to balance computational cost and visual detail.
+
+\subsection{Software Architecture}
+
+The control software is implemented in Python without a dependency on ROS, communicating directly with the robot hardware through the manufacturer's SDK. This lightweight architecture enables rapid prototyping and low-latency control. The policy inference loop runs at 20\,Hz, while the command execution thread runs at 30\,Hz with exponential moving average (EMA) smoothing and velocity limits applied per joint for safe operation.
+
+% =====================================================
+\section{VR-Based Teleoperation}
+
+Collecting human demonstrations is a critical step in imitation learning. The quality and diversity of the demonstrations directly influence the performance of the learned policy \cite{mandlekar2021matters}. We developed a VR-based teleoperation system using a Meta Quest~3 headset that allows an operator to intuitively control the robot arm using natural hand motions.
+
+\subsection{System Design}
+
+The teleoperation system uses a split-machine architecture to accommodate the different operating system requirements of the VR hardware and the robot controller:
+
+\begin{enumerate}
+    \item A \textbf{VR sender} application runs on a Windows machine, reading 6-DoF pose data (position and orientation) from the Quest~3 controllers via the OpenVR/SteamVR interface at 20--30\,Hz;
+    \item A lightweight \textbf{HTTP relay server} receives the VR pose data and makes it available to the robot controller; and
+    \item The \textbf{robot controller} on the Ubuntu machine reads the pose data, computes the desired robot motion, and sends commands to the physical arm.
+\end{enumerate}
+
+The VR controller pose is mapped to the robot's coordinate frame through a fixed transformation that accounts for the difference between the VR and robot reference frames. A calibration step at the beginning of each session establishes the home pose by averaging the controller position over a short interval.
+
+\subsection{Control and Safety}
+
+To ensure smooth and safe operation during teleoperation, several measures are applied:
+\begin{itemize}
+    \item \textbf{EMA smoothing} with a per-axis coefficient filters out high-frequency noise from the VR tracking;
+    \item \textbf{Deadband thresholds} (0.5\,cm for translation, 1$^\circ$ for rotation) prevent the robot from responding to unintentional hand tremor; and
+    \item \textbf{Velocity caps} (1\,cm/step for translation, 2.5$^\circ$/step for rotation) limit the maximum speed of the robot to prevent abrupt or dangerous motions.
+\end{itemize}
+
+\subsection{Evaluation of Teleoperation Performance}
+
+To quantify the effectiveness of our teleoperation system, we propose the following metrics:
+
+\begin{itemize}
+    \item \textbf{Task completion rate}: the percentage of teleoperated demonstrations that successfully complete the full pick-inspect-place sequence without requiring a reset;
+    \item \textbf{Average task completion time}: the mean time taken by the operator to complete one full demonstration cycle;
+    \item \textbf{End-effector tracking accuracy}: the root-mean-square error (RMSE) between the commanded and actual end-effector positions, measured over the course of a demonstration;
+    \item \textbf{Operator learning curve}: the improvement in completion time and success rate as the operator gains experience over successive sessions; and
+    \item \textbf{Demonstration consistency}: the variance in trajectories across repeated demonstrations of the same sub-task, indicating how reproducible the operator's motions are.
+\end{itemize}
+
+\placeholder{INSERT TABLE: Teleoperation performance metrics. Columns: Metric, Value. Rows: Task completion rate (\%), Avg. completion time (s), End-effector RMSE (mm), Number of demonstrations collected, Avg. episode length (frames).}
+
+\placeholder{INSERT FIGURE: Photos of the VR teleoperation setup showing (a) the operator wearing the Quest 3 headset, (b) the robot arm following the operator's commands.}
+
+\subsection{Comparison with Vision-Based Teleoperation}
+
+Before adopting the VR-based approach, we experimented with a vision-based teleoperation method where a camera tracked the operator's hand pose and mapped it to the robot's end-effector. While this approach has the advantage of requiring no specialized hardware beyond a camera, we found that it was insufficient for our task. The primary limitation was the \textbf{lack of reliable 3D orientation estimation}. Camera-based hand tracking systems typically provide reasonable position estimates but struggle to capture the full 6-DoF pose, particularly the wrist rotation, which is essential for grasping and placing tools at precise angles. As a result, the robot could reach the approximate location of the target but could not orient the gripper correctly for a successful grasp.
+
+This finding motivated our transition to VR-based teleoperation, which provides accurate 6-DoF tracking of both position and orientation from the controllers. The VR system also offers a more natural and immersive control experience, reducing the cognitive load on the operator and leading to higher-quality demonstrations.
+
+% =====================================================
+\section{Data Collection Pipeline}
+
+A well-structured data collection pipeline is essential for training robust visuomotor policies. We designed our pipeline to capture rich, synchronized observations from multiple sensors and store them in a format suitable for efficient training.
+
+\subsection{Data Format and Storage}
+
+Each demonstration episode is recorded as a synchronized stream of:
+\begin{itemize}
+    \item Joint positions (6 joints + gripper), representing the robot's proprioceptive state;
+    \item End-effector pose (position and orientation), providing Cartesian workspace information;
+    \item RGB images from the global and wrist cameras; and
+    \item Timestamps for temporal alignment.
+\end{itemize}
+
+The raw data is stored in the LeRobot v2.1 format \cite{cadene2024lerobot}, which uses Parquet files for numerical data and MP4 files for video streams, along with structured metadata. For training, the data is converted to the Zarr format, which provides efficient chunked, compressed, and memory-mapped access to large arrays. This is particularly important for image data, which constitutes the bulk of the storage.
+
+\subsection{Episode Partitioning}
+
+The full inspection task consists of multiple sub-tasks: picking the tool, bringing it to the inspection station, and placing it in the correct bin. Rather than training a single policy for the entire sequence, we partition each demonstration into sub-task segments. This is done using an interactive annotation tool that allows a human annotator to mark the transition points between sub-tasks while reviewing the recorded video. The partitioned data enables training of specialized policies for each sub-task, which can then be composed sequentially during deployment.
+
+\placeholder{INSERT FIGURE: Example frames from the data collection pipeline showing (a) global camera view during pick, (b) wrist camera view during pick, (c) global camera view during inspect, (d) wrist camera view during inspect.}
+
+\subsection{Dataset Statistics}
+
+\placeholder{INSERT TABLE: Dataset summary. Columns: Sub-task, Number of Episodes, Total Frames, Avg. Episode Length (s). Rows: Pick, Inspect, Place (good), Place (bad), Total.}
+
+% =====================================================
+\section{Policy Architecture and Training}
+
+\subsection{Diffusion Policy}
+
+We adopt the Diffusion Policy framework \cite{chi2023diffusion} for learning visuomotor manipulation skills. Diffusion Policy models the distribution of expert actions as a denoising diffusion process \cite{ho2020ddpm}, where a neural network is trained to iteratively denoise a random Gaussian sample into a coherent action trajectory. This approach is well-suited for manipulation because it can capture multi-modal action distributions---situations where multiple valid actions exist for the same observation.
+
+Our implementation consists of two main components:
+\begin{itemize}
+    \item A \textbf{vision encoder} based on ResNet-18 \cite{he2016resnet} that processes images from each camera independently and produces a compact spatial feature representation; and
+    \item A \textbf{conditional 1D U-Net} that takes the visual features and proprioceptive state as conditioning input, and predicts a sequence of future actions through iterative denoising.
+\end{itemize}
+
+The policy observes the two most recent timesteps (observation horizon of 2) and predicts 16 future action steps (prediction horizon of 16), of which 8 are executed before re-planning (action horizon of 8). During training, the DDPM noise schedule is used, while during inference, the faster DDIM \cite{song2020ddim} schedule with 10 denoising steps is employed for real-time performance.
+
+\subsection{Training Details}
+
+The policy is trained using the AdamW optimizer with a cosine annealing learning rate schedule. Training is performed on a single GPU. To improve training stability over long runs, an automatic restart mechanism periodically refreshes the training process. An exponential moving average (EMA) of the model weights is maintained and used for inference.
+
+\placeholder{INSERT TABLE: Training hyperparameters. Columns: Parameter, Value. Rows: Observation horizon, Prediction horizon, Action horizon, Learning rate, Batch size, Optimizer, Number of training epochs.}
+
+% =====================================================
+\section{Preliminary Results and Findings}
+
+\subsection{Single-Camera Policy Experiments}
+
+In our initial experiments, we trained the diffusion policy using only the global (fixed) camera as the visual input. While the policy was able to learn coarse reaching motions toward the target object, it consistently failed to achieve precise grasps. The global camera provides a broad view of the workspace but lacks the spatial resolution and viewpoint necessary to capture fine-grained details near the gripper---such as the exact position and orientation of the tool relative to the fingers.
+
+This finding highlights the \textbf{importance of wrist-mounted cameras} for contact-rich manipulation tasks. The ego-centric viewpoint provided by the wrist camera captures the local geometry around the grasp point, which is critical information that is either occluded or too small to resolve in the global view. Based on this result, all subsequent experiments include both the global and wrist cameras as inputs to the policy.
+
+\placeholder{INSERT FIGURE: Comparison of policy behavior with (a) global camera only --- arm reaches toward the object but fails to grasp, and (b) global + wrist camera --- arm successfully grasps the object. Show representative frames from rollouts.}
+
+\subsection{Preliminary Training Metrics}
+
+We have trained sub-task policies for the pick and inspect phases. The training loss (mean squared error of the predicted noise) converges over the course of training, indicating that the model is successfully learning the action distribution from the demonstrations.
+
+\placeholder{INSERT FIGURE: Training loss curves for the pick and inspect sub-task policies, showing convergence over epochs.}
+
+\placeholder{INSERT TABLE: Preliminary policy evaluation. Columns: Sub-task, Camera Configuration, Grasp Success Rate (\%), Avg. Position Error at Grasp (mm). Rows: Pick (global only), Pick (global + wrist), Inspect (global + wrist).}
+
+% =====================================================
+\section{Visual Inspection and Classification}
+\label{sec:inspection}
+
+The visual inspection and classification module is a critical component of the full pipeline. This module is responsible for analyzing the object once it has been picked and presented to the inspection station. It must determine whether the object meets quality standards and classify it accordingly for sorting.
+
+\textcolor{red}{\textbf{Note to collaborator:} This section requires input from the team member working on the inspection and classification component. The following information is needed to complete this section:}
+
+\begin{enumerate}
+    \item \textcolor{red}{\textbf{Inspection method:} What approach is used for defect detection? (e.g., VLM-based classification, fine-tuned vision model, traditional image processing, or a combination)}
+    \item \textcolor{red}{\textbf{Defect taxonomy:} What types of defects are being detected? (e.g., surface scratches, discoloration, deformation, missing components)}
+    \item \textcolor{red}{\textbf{Classification categories:} How many quality classes are defined? (e.g., pass/fail, or a graded scale)}
+    \item \textcolor{red}{\textbf{Dataset:} How many inspection images have been collected and labeled? What is the class distribution?}
+    \item \textcolor{red}{\textbf{Model architecture:} What model is used for classification? What is the input resolution and inference time?}
+    \item \textcolor{red}{\textbf{Performance metrics:} Classification accuracy, precision, recall, F1-score, and confusion matrix}
+    \item \textcolor{red}{\textbf{Integration:} How does the classification output interface with the manipulation pipeline? (e.g., API call, shared variable, ROS topic)}
+    \item \textcolor{red}{\textbf{Figures:} Example images of good vs.\ defective tools, the inspection camera setup, and any classification result visualizations}
+\end{enumerate}
+
+% =====================================================
+\section{Discussion}
+
+\subsection{Lessons Learned}
+
+Several important lessons emerged during the development of this system:
+
+\textbf{VR teleoperation provides high-quality demonstrations.} Compared to kinesthetic teaching or vision-based teleoperation, the VR-based approach offered the best combination of control accuracy, operator comfort, and data quality. The 6-DoF tracking of the controllers maps naturally to the robot's workspace, and the smoothing and safety filters prevent the collection of noisy or unsafe demonstrations.
+
+\textbf{Wrist cameras are essential for precision tasks.} Our experiments confirmed that a single fixed camera is insufficient for tasks requiring precise grasping. The wrist camera provides the critical close-up view needed for the policy to learn fine-grained manipulation behaviors.
+
+\textbf{Vision-based teleoperation has fundamental limitations.} While attractive for its simplicity, camera-based hand tracking cannot reliably recover the full 6-DoF wrist pose. For tasks that require controlled orientation---such as grasping elongated tools at specific angles---this limitation makes vision-based teleoperation impractical with current hand tracking technology.
+
+\textbf{Sub-task decomposition simplifies learning.} Partitioning the full task into shorter sub-tasks (pick, inspect, place) reduces the complexity of each individual policy and allows for targeted data collection and evaluation.
+
+\subsection{Limitations and Future Work}
+
+Our current system has several limitations. The visuomotor policy has been trained and tested on a limited set of tools with relatively simple geometries. Extending to a wider variety of objects will require additional demonstrations and potentially more expressive policy architectures. The inspection and classification module is under development by a collaborator and has not yet been integrated with the manipulation pipeline. Future work will focus on: (1)~integrating the VLM-based inspection module to close the loop between perception and action; (2)~scaling the demonstration dataset to improve policy robustness; (3)~exploring the use of pre-trained VLA models \cite{kim2024openvla, black2024pi0} to reduce the data requirements; and (4)~deploying the full dual-arm system for end-to-end autonomous inspection.
+
+% =====================================================
+\section{Conclusion}
+
+We have presented a framework for autonomous robotic quality inspection that follows the unified Language $\rightarrow$ Perception $\rightarrow$ Action paradigm. Our system integrates VR-based teleoperation for demonstration collection, a structured data pipeline for training, and a diffusion-based visuomotor policy for manipulation. Through preliminary experiments, we demonstrated the importance of multi-camera observation (particularly wrist-mounted cameras) and identified the limitations of alternative teleoperation approaches. While the full system integration is ongoing, the individual components provide a solid foundation for building toward a fully autonomous inspection and sorting pipeline.
+
+% =====================================================
+\section*{Acknowledgements}
+
+\placeholder{INSERT: Funding sources, lab affiliations, and acknowledgements.}
+
+% =====================================================
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

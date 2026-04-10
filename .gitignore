@@ -44,3 +44,4 @@ Thumbs.db
 .env
 *.key
 *.pem
+openvla-ft/

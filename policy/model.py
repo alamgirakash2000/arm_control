@@ -1,26 +1,78 @@
-"""Diffusion Policy model components.
+"""SigLIP + DINOv2 fused vision encoder + Diffusion Transformer (DiT).
 
-Architecture from Chi et al. "Diffusion Policy" (2023):
-- SpatialSoftmax + ResNet18 vision encoder
-- ConditionalUnet1D noise prediction network
-- EMA model wrapper
+Architecture (ScaleDP-style):
+    FusedVisionEncoder: SigLIP CLS + DINOv2 CLS → concat (1536) → project (512)
+    DiffusionTransformer: DiT-Small (12 layers, 384 dim, 6 heads) for action denoising
+    EMAModel: exponential moving average for stable inference
+
+Key DiT features vs U-Net:
+    - AdaLN (Adaptive Layer Norm) for timestep conditioning
+    - Cross-attention for observation conditioning (not FiLM)
+    - Non-causal self-attention across action timesteps
 """
 
 import math
 import copy
-from typing import Union, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
-import einops
-from einops.layers.torch import Rearrange
 
 
-# ============================================================
-# Building blocks
-# ============================================================
+# ── Fused Vision Encoder ────────────────────────────────────────────────────
+
+class FusedVisionEncoder(nn.Module):
+    """SigLIP + DINOv2 fused into a single feature vector."""
+
+    def __init__(self, siglip_model_name, dinov2_model_name,
+                 fused_dim=1536, proj_dim=512, freeze=False):
+        super().__init__()
+        from transformers import SiglipVisionModel, Dinov2Model
+
+        self.siglip = SiglipVisionModel.from_pretrained(siglip_model_name)
+        self.dinov2 = Dinov2Model.from_pretrained(dinov2_model_name)
+        self.frozen = freeze
+
+        if freeze:
+            for p in self.siglip.parameters():
+                p.requires_grad = False
+            for p in self.dinov2.parameters():
+                p.requires_grad = False
+            self.siglip.eval()
+            self.dinov2.eval()
+
+        self.projection = nn.Sequential(
+            nn.Linear(fused_dim, 768),
+            nn.GELU(),
+            nn.Linear(768, proj_dim),
+        )
+
+        self.register_buffer("siglip_mean",
+                             torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1))
+        self.register_buffer("siglip_std",
+                             torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1))
+        self.register_buffer("dino_mean",
+                             torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("dino_std",
+                             torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, images):
+        img_siglip = (images - self.siglip_mean) / self.siglip_std
+        img_dino = (images - self.dino_mean) / self.dino_std
+
+        if self.frozen:
+            with torch.no_grad():
+                feat_siglip = self.siglip(pixel_values=img_siglip).pooler_output
+                feat_dino = self.dinov2(img_dino).pooler_output
+        else:
+            feat_siglip = self.siglip(pixel_values=img_siglip).pooler_output
+            feat_dino = self.dinov2(img_dino).pooler_output
+
+        fused = torch.cat([feat_siglip, feat_dino], dim=-1)
+        return self.projection(fused)
+
+
+# ── Diffusion Transformer (DiT) — ScaleDP-style ────────────────────────────
 
 class SinusoidalPosEmb(nn.Module):
     """Sinusoidal positional embedding for diffusion timesteps."""
@@ -30,342 +82,244 @@ class SinusoidalPosEmb(nn.Module):
         self.dim = dim
 
     def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
+        half = self.dim // 2
+        emb = math.log(10000) / (half - 1)
+        emb = torch.exp(torch.arange(half, device=x.device) * -emb)
+        emb = x[:, None].float() * emb[None, :]
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
 
 
-class Downsample1d(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
+class AdaLN(nn.Module):
+    """Adaptive Layer Norm — conditions layer norm with timestep + obs embedding.
 
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Upsample1d(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Conv1dBlock(nn.Module):
-    """Conv1d -> GroupNorm -> Mish"""
-
-    def __init__(self, in_channels, out_channels, kernel_size, n_groups=8):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size,
-                      padding=kernel_size // 2),
-            nn.GroupNorm(n_groups, out_channels),
-            nn.Mish(),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class ConditionalResidualBlock1D(nn.Module):
-    """Residual block with FiLM conditioning."""
-
-    def __init__(self, in_channels, out_channels, cond_dim,
-                 kernel_size=3, n_groups=8, cond_predict_scale=False):
-        super().__init__()
-        self.blocks = nn.ModuleList([
-            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups),
-            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups),
-        ])
-
-        cond_channels = out_channels * 2 if cond_predict_scale else out_channels
-        self.cond_predict_scale = cond_predict_scale
-        self.out_channels = out_channels
-        self.cond_encoder = nn.Sequential(
-            nn.Mish(),
-            nn.Linear(cond_dim, cond_channels),
-            Rearrange("batch t -> batch t 1"),
-        )
-        self.residual_conv = (nn.Conv1d(in_channels, out_channels, 1)
-                              if in_channels != out_channels else nn.Identity())
-
-    def forward(self, x, cond):
-        out = self.blocks[0](x)
-        embed = self.cond_encoder(cond)
-        if self.cond_predict_scale:
-            embed = embed.reshape(embed.shape[0], 2, self.out_channels, 1)
-            scale = embed[:, 0, ...]
-            bias = embed[:, 1, ...]
-            out = scale * out + bias
-        else:
-            out = out + embed
-        out = self.blocks[1](out)
-        out = out + self.residual_conv(x)
-        return out
-
-
-# ============================================================
-# ConditionalUnet1D — noise prediction network
-# ============================================================
-
-class ConditionalUnet1D(nn.Module):
-    """1D temporal U-Net for diffusion noise prediction.
-
-    Adapted from Chi et al. "Diffusion Policy" reference implementation.
+    Instead of FiLM (scale+bias on features), AdaLN modulates the
+    layer norm parameters themselves. This is the key innovation from DiT/ScaleDP.
     """
 
-    def __init__(self, input_dim, global_cond_dim=None,
-                 diffusion_step_embed_dim=256, down_dims=(256, 512, 1024),
-                 kernel_size=5, n_groups=8, cond_predict_scale=True):
+    def __init__(self, hidden_dim, cond_dim):
         super().__init__()
-        all_dims = [input_dim] + list(down_dims)
-        start_dim = down_dims[0]
-
-        # Diffusion timestep encoder
-        dsed = diffusion_step_embed_dim
-        self.diffusion_step_encoder = nn.Sequential(
-            SinusoidalPosEmb(dsed),
-            nn.Linear(dsed, dsed * 4),
-            nn.Mish(),
-            nn.Linear(dsed * 4, dsed),
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        # Predict scale (gamma) and shift (beta) from conditioning
+        self.proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, hidden_dim * 2),
         )
 
-        cond_dim = dsed
-        if global_cond_dim is not None:
-            cond_dim += global_cond_dim
+    def forward(self, x, cond):
+        """
+        x: (B, T, D)
+        cond: (B, cond_dim)
+        """
+        gamma_beta = self.proj(cond).unsqueeze(1)  # (B, 1, 2*D)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)  # each (B, 1, D)
+        return self.norm(x) * (1 + gamma) + beta
 
-        in_out = list(zip(all_dims[:-1], all_dims[1:]))
 
-        # Down path
-        self.down_modules = nn.ModuleList()
-        for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = ind >= len(in_out) - 1
-            self.down_modules.append(nn.ModuleList([
-                ConditionalResidualBlock1D(dim_in, dim_out, cond_dim,
-                                           kernel_size, n_groups, cond_predict_scale),
-                ConditionalResidualBlock1D(dim_out, dim_out, cond_dim,
-                                           kernel_size, n_groups, cond_predict_scale),
-                Downsample1d(dim_out) if not is_last else nn.Identity(),
-            ]))
+class DiTBlock(nn.Module):
+    """Single Diffusion Transformer block.
 
-        # Middle
-        mid_dim = all_dims[-1]
-        self.mid_modules = nn.ModuleList([
-            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim,
-                                       kernel_size, n_groups, cond_predict_scale),
-            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim,
-                                       kernel_size, n_groups, cond_predict_scale),
-        ])
+    Components:
+        1. AdaLN + Non-causal Self-Attention (action tokens attend to all others)
+        2. Cross-Attention to observation conditioning
+        3. AdaLN + Feed-Forward Network
+    """
 
-        # Up path
-        self.up_modules = nn.ModuleList()
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
-            is_last = ind >= len(in_out) - 1
-            self.up_modules.append(nn.ModuleList([
-                ConditionalResidualBlock1D(dim_out * 2, dim_in, cond_dim,
-                                           kernel_size, n_groups, cond_predict_scale),
-                ConditionalResidualBlock1D(dim_in, dim_in, cond_dim,
-                                           kernel_size, n_groups, cond_predict_scale),
-                Upsample1d(dim_in) if not is_last else nn.Identity(),
-            ]))
+    def __init__(self, hidden_dim, num_heads, cond_dim, obs_dim, mlp_ratio=4.0):
+        super().__init__()
 
-        self.final_conv = nn.Sequential(
-            Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
-            nn.Conv1d(start_dim, input_dim, 1),
+        # Self-attention with AdaLN
+        self.adaln_sa = AdaLN(hidden_dim, cond_dim)
+        self.self_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True)
+
+        # Cross-attention to observation
+        self.norm_cross = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True,
+            kdim=obs_dim, vdim=obs_dim)
+
+        # Feed-forward with AdaLN
+        self.adaln_ff = AdaLN(hidden_dim, cond_dim)
+        mlp_dim = int(hidden_dim * mlp_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, hidden_dim),
         )
 
-    def forward(self, sample, timestep, global_cond=None):
+    def forward(self, x, cond, obs_tokens):
         """
-        Args:
-            sample: (B, T, input_dim) — noisy action sequence
-            timestep: (B,) or scalar — diffusion timestep
-            global_cond: (B, global_cond_dim) — observation conditioning
-        Returns:
-            (B, T, input_dim) — predicted noise
+        x: (B, T, D) — noisy action tokens
+        cond: (B, cond_dim) — timestep + global conditioning
+        obs_tokens: (B, N_obs, obs_dim) — observation token sequence
         """
-        # (B, T, D) -> (B, D, T) for Conv1d
-        x = einops.rearrange(sample, "b t d -> b d t")
+        # Self-attention (non-causal — all action tokens see each other)
+        h = self.adaln_sa(x, cond)
+        h, _ = self.self_attn(h, h, h)
+        x = x + h
 
-        # Encode timestep
-        if not torch.is_tensor(timestep):
-            timestep = torch.tensor([timestep], dtype=torch.long,
-                                    device=sample.device)
-        elif len(timestep.shape) == 0:
-            timestep = timestep[None].to(sample.device)
-        timestep = timestep.expand(sample.shape[0])
+        # Cross-attention to observation
+        h = self.norm_cross(x)
+        h, _ = self.cross_attn(h, obs_tokens, obs_tokens)
+        x = x + h
 
-        global_feature = self.diffusion_step_encoder(timestep)
-        if global_cond is not None:
-            global_feature = torch.cat([global_feature, global_cond], dim=-1)
+        # Feed-forward
+        h = self.adaln_ff(x, cond)
+        h = self.ffn(h)
+        x = x + h
 
-        # Down
-        h = []
-        for resnet, resnet2, downsample in self.down_modules:
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            h.append(x)
-            x = downsample(x)
-
-        # Middle
-        for mid_module in self.mid_modules:
-            x = mid_module(x, global_feature)
-
-        # Up
-        for resnet, resnet2, upsample in self.up_modules:
-            x = torch.cat((x, h.pop()), dim=1)
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            x = upsample(x)
-
-        x = self.final_conv(x)
-        x = einops.rearrange(x, "b d t -> b t d")
         return x
 
 
-# ============================================================
-# Vision Encoder — ResNet18 + SpatialSoftmax
-# ============================================================
+class DiffusionTransformer(nn.Module):
+    """Diffusion Transformer for action sequence denoising (ScaleDP-style).
 
-class SpatialSoftmax(nn.Module):
-    """Compute expected (x, y) coordinates for each feature channel."""
+    Replaces the 1D U-Net. Key advantages:
+    - Cross-attention directly attends to observation features (stronger than FiLM)
+    - Non-causal self-attention reduces compounding errors across action horizon
+    - AdaLN provides stable conditioning of timestep information
 
-    def __init__(self, height, width, num_channels):
-        super().__init__()
-        # Create coordinate grids
-        pos_x, pos_y = torch.meshgrid(
-            torch.linspace(-1, 1, height),
-            torch.linspace(-1, 1, width),
-            indexing="ij")
-        self.register_buffer("pos_x", pos_x.reshape(-1))  # (H*W,)
-        self.register_buffer("pos_y", pos_y.reshape(-1))
-
-    def forward(self, feature_map):
-        """
-        Args:
-            feature_map: (B, C, H, W)
-        Returns:
-            (B, C*2) — expected (x, y) per channel
-        """
-        B, C, H, W = feature_map.shape
-        flat = feature_map.reshape(B, C, -1)       # (B, C, H*W)
-        softmax = F.softmax(flat, dim=-1)           # (B, C, H*W)
-        exp_x = (softmax * self.pos_x).sum(dim=-1)  # (B, C)
-        exp_y = (softmax * self.pos_y).sum(dim=-1)
-        return torch.cat([exp_x, exp_y], dim=-1)   # (B, C*2)
-
-
-def _replace_bn_with_gn(module, num_groups=16):
-    """Replace all BatchNorm2d layers with GroupNorm."""
-    for name, child in module.named_children():
-        if isinstance(child, nn.BatchNorm2d):
-            num_ch = child.num_features
-            gn = nn.GroupNorm(min(num_groups, num_ch), num_ch)
-            setattr(module, name, gn)
-        else:
-            _replace_bn_with_gn(child, num_groups)
-
-
-class VisionEncoder(nn.Module):
-    """ResNet18 backbone with SpatialSoftmax for spatial feature extraction.
-
-    Supports any input resolution — SpatialSoftmax dimensions are computed
-    dynamically on the first forward pass.
+    Configs (from ScaleDP paper):
+        Tiny:  8 layers, 256 dim, 4 heads, ~10M
+        Small: 12 layers, 384 dim, 6 heads, ~33M
+        Base:  12 layers, 768 dim, 12 heads, ~130M
     """
 
-    def __init__(self, out_dim=256, freeze_bn=True):
+    def __init__(self, action_dim=7, pred_horizon=16, hidden_dim=384,
+                 num_layers=12, num_heads=6, global_cond_dim=None,
+                 obs_cond_dim=None, mlp_ratio=4.0):
         super().__init__()
-        resnet = models.resnet18(weights=None)
-        _replace_bn_with_gn(resnet)
+        self.action_dim = action_dim
+        self.pred_horizon = pred_horizon
+        self.hidden_dim = hidden_dim
 
-        # Remove avgpool and fc — we use SpatialSoftmax instead
-        self.backbone = nn.Sequential(
-            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
-            resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4,
+        # Diffusion timestep embedding
+        self.time_embed = nn.Sequential(
+            SinusoidalPosEmb(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
         )
-        # ResNet18 layer4 output: 512 channels
-        # SpatialSoftmax + projection are built lazily on first forward
-        self.out_dim = out_dim
-        self.spatial_softmax = None
-        self.projection = None
-        self._feat_h = None
-        self._feat_w = None
 
-        # ImageNet normalization
-        self.register_buffer("img_mean",
-                             torch.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1))
-        self.register_buffer("img_std",
-                             torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1))
+        # Condition projection (global_cond → hidden_dim for AdaLN)
+        cond_dim = hidden_dim
+        if global_cond_dim is not None:
+            self.cond_proj = nn.Linear(global_cond_dim, hidden_dim)
+        else:
+            self.cond_proj = None
+        # Total AdaLN conditioning = timestep_embed + projected_global_cond
+        adaln_cond_dim = hidden_dim + hidden_dim if global_cond_dim else hidden_dim
 
-    def _init_head(self, feat_h, feat_w, device):
-        """Build SpatialSoftmax + projection once we know the feature map size."""
-        self._feat_h = feat_h
-        self._feat_w = feat_w
-        self.spatial_softmax = SpatialSoftmax(feat_h, feat_w, 512).to(device)
-        self.projection = nn.Linear(512 * 2, self.out_dim).to(device)
+        # Observation projection for cross-attention keys/values
+        obs_dim = hidden_dim
+        if obs_cond_dim is not None and obs_cond_dim != hidden_dim:
+            self.obs_proj = nn.Linear(obs_cond_dim, hidden_dim)
+        else:
+            self.obs_proj = None
+            obs_dim = obs_cond_dim or hidden_dim
 
-    def forward(self, images):
+        # Action token embedding: project action_dim → hidden_dim
+        self.action_embed = nn.Linear(action_dim, hidden_dim)
+
+        # Learnable positional embedding for action sequence
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, pred_horizon, hidden_dim) * 0.02)
+
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden_dim, num_heads, adaln_cond_dim, obs_dim, mlp_ratio)
+            for _ in range(num_layers)
+        ])
+
+        # Final norm + projection back to action_dim
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.final_proj = nn.Linear(hidden_dim, action_dim)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        # Zero-init the final projection (diffusion convention)
+        nn.init.zeros_(self.final_proj.weight)
+        nn.init.zeros_(self.final_proj.bias)
+
+    def forward(self, sample, timestep, global_cond=None, obs_tokens=None):
         """
         Args:
-            images: (B, 3, H, W) float32 in [0, 1] range
+            sample: (B, T, action_dim) — noisy action sequence
+            timestep: (B,) or scalar — diffusion timestep
+            global_cond: (B, global_cond_dim) — flattened observation conditioning
+            obs_tokens: (B, N, obs_feat_dim) — observation token sequence for cross-attn
+                        If None, constructs from global_cond by reshaping
         Returns:
-            (B, out_dim) visual feature vector
+            (B, T, action_dim) — predicted noise
         """
-        x = (images - self.img_mean) / self.img_std
-        features = self.backbone(x)           # (B, 512, fH, fW)
-        if self.spatial_softmax is None:
-            self._init_head(features.shape[2], features.shape[3], features.device)
-        spatial = self.spatial_softmax(features)  # (B, 1024)
-        return self.projection(spatial)       # (B, out_dim)
+        B = sample.shape[0]
+
+        # Embed timestep
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+        elif len(timestep.shape) == 0:
+            timestep = timestep[None].to(sample.device)
+        timestep = timestep.expand(B)
+        t_emb = self.time_embed(timestep)  # (B, hidden_dim)
+
+        # Build AdaLN conditioning: [timestep_emb, projected_global_cond]
+        if self.cond_proj is not None and global_cond is not None:
+            cond = torch.cat([t_emb, self.cond_proj(global_cond)], dim=-1)
+        else:
+            cond = t_emb
+
+        # Build observation tokens for cross-attention
+        if obs_tokens is None and global_cond is not None:
+            # Reshape global_cond into token sequence
+            obs_tokens = global_cond.unsqueeze(1)  # (B, 1, cond_dim)
+        if self.obs_proj is not None and obs_tokens is not None:
+            obs_tokens = self.obs_proj(obs_tokens)
+
+        # Embed noisy actions into hidden_dim
+        x = self.action_embed(sample) + self.pos_embed[:, :sample.shape[1], :]
+
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x, cond, obs_tokens)
+
+        # Final projection
+        x = self.final_norm(x)
+        x = self.final_proj(x)
+
+        return x
 
 
-# ============================================================
-# EMA Model
-# ============================================================
+# ── EMA Model ───────────────────────────────────────────────────────────────
 
 class EMAModel:
-    """Exponential Moving Average of model parameters for stable inference."""
-
     def __init__(self, model, power=0.75):
         self.averaged_model = copy.deepcopy(model)
         self.averaged_model.eval()
         self.power = power
-        self.optimization_step = 0
-        self._param_pairs = None
+        self.step = 0
+        self._pairs = None
 
-    def refresh_parameter_cache(self, model):
-        ema_named = tuple(self.averaged_model.named_parameters())
-        model_named = tuple(model.named_parameters())
-
-        if len(ema_named) != len(model_named):
-            raise ValueError(
-                "EMA/model parameter count mismatch: "
-                f"{len(ema_named)} vs {len(model_named)}"
-            )
-
-        param_pairs = []
-        for (ema_name, ema_param), (model_name, model_param) in zip(ema_named, model_named):
-            if ema_name != model_name:
-                raise ValueError(
-                    "EMA/model parameter name mismatch: "
-                    f"{ema_name!r} vs {model_name!r}"
-                )
-            param_pairs.append((ema_param, model_param))
-        self._param_pairs = tuple(param_pairs)
-
-    def get_decay(self, step):
-        return 1 - (1 + step) ** (-self.power)
+    def _refresh(self, model):
+        self._pairs = tuple(
+            (ep, mp) for (_, ep), (_, mp)
+            in zip(self.averaged_model.named_parameters(),
+                   model.named_parameters()))
 
     @torch.no_grad()
-    def step(self, model):
-        if self._param_pairs is None:
-            self.refresh_parameter_cache(model)
-        self.optimization_step += 1
-        decay = self.get_decay(self.optimization_step)
-        for ema_p, model_p in self._param_pairs:
-            ema_p.data.mul_(decay).add_(model_p.data, alpha=1.0 - decay)
+    def update(self, model):
+        if self._pairs is None:
+            self._refresh(model)
+        self.step += 1
+        decay = 1 - (1 + self.step) ** (-self.power)
+        for ema_p, model_p in self._pairs:
+            ema_p.data.mul_(decay).add_(model_p.data, alpha=1 - decay)
+
+    def state_dict(self):
+        return {"averaged_model": self.averaged_model.state_dict(),
+                "step": self.step}
+
+    def load_state_dict(self, d):
+        self.averaged_model.load_state_dict(d["averaged_model"])
+        self.step = d["step"]
